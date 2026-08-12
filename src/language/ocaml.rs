@@ -5,8 +5,8 @@ use tree_sitter::{Node, Parser};
 
 use super::{FileContext, FrontendResult, LanguageFrontend};
 use crate::model::{
-    CallLabel, CallSite, CallSyntax, FileAnalysis, FunctionInfo, LanguageFact, LanguageId,
-    SourceSpan, SymbolId,
+    CallLabel, CallSite, CallSyntax, CallTarget, FileAnalysis, FunctionInfo, LanguageFact,
+    LanguageId, SourceSpan, SymbolId,
 };
 
 /// OCaml syntax frontend.
@@ -242,7 +242,7 @@ fn collect_calls(
         {
             calls.push(CallSite {
                 syntax: CallSyntax::Path(parts),
-                target: None,
+                target: CallTarget::Unresolved,
                 label: CallLabel::new(normalize_source(node_text(node, source))),
                 span: tree_sitter_span(file, node),
             });

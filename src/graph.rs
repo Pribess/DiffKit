@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::model::{CallNode, CallSyntax, FileAnalysis, FunctionInfo, LanguageFact, SymbolId};
+use crate::model::{
+    CallLabel, CallNode, CallRelation, CallSite, CallSyntax, CallTarget, DispatchCandidate,
+    FileAnalysis, FunctionInfo, LanguageFact, SymbolId,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct ProgramGraph {
@@ -76,13 +79,21 @@ impl ProgramGraph {
 
     pub fn build_call_tree(&self, entry: &SymbolId, max_depth: usize) -> Option<CallNode> {
         self.functions.get(entry)?;
-        Some(self.expand(entry, None, 0, max_depth, &mut HashSet::new()))
+        Some(self.expand(
+            entry,
+            None,
+            CallRelation::Call,
+            0,
+            max_depth,
+            &mut HashSet::new(),
+        ))
     }
 
     fn expand(
         &self,
         symbol: &SymbolId,
-        callsite_label: Option<&crate::model::CallLabel>,
+        callsite_label: Option<&CallLabel>,
+        relation: CallRelation,
         depth: usize,
         max_depth: usize,
         visiting: &mut HashSet<SymbolId>,
@@ -99,6 +110,7 @@ impl ProgramGraph {
             return CallNode {
                 key: symbol.to_string(),
                 label,
+                relation,
                 children: Vec::new(),
             };
         }
@@ -107,6 +119,7 @@ impl ProgramGraph {
             return CallNode {
                 key: symbol.to_string(),
                 label: label.with_suffix(" ⇄"),
+                relation,
                 children: Vec::new(),
             };
         }
@@ -114,34 +127,131 @@ impl ProgramGraph {
         let children = function
             .calls
             .iter()
-            .map(|call| {
-                let target = call
-                    .target
-                    .clone()
-                    .or_else(|| self.resolve_call(symbol, &call.syntax));
-                if let Some(target) = target.filter(|target| self.functions.contains_key(target)) {
-                    self.expand(&target, Some(&call.label), depth + 1, max_depth, visiting)
-                } else {
-                    let key = call
-                        .target
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| {
-                            format!("{}://?{}", symbol.language, call.syntax.key_fragment())
-                        });
-                    CallNode {
-                        key,
-                        label: call.label.clone(),
-                        children: Vec::new(),
-                    }
-                }
-            })
+            .map(|call| self.expand_call(symbol, call, depth + 1, max_depth, visiting))
             .collect();
 
         visiting.remove(symbol);
         CallNode {
             key: symbol.to_string(),
             label,
+            relation,
+            children,
+        }
+    }
+
+    fn expand_call(
+        &self,
+        caller: &SymbolId,
+        call: &CallSite,
+        depth: usize,
+        max_depth: usize,
+        visiting: &mut HashSet<SymbolId>,
+    ) -> CallNode {
+        match &call.target {
+            CallTarget::Dynamic {
+                dispatch,
+                candidates,
+                open,
+            } => self.expand_dynamic_call(
+                dispatch,
+                &call.label,
+                candidates,
+                *open,
+                depth,
+                max_depth,
+                visiting,
+            ),
+            CallTarget::Direct(target) => self.expand_direct_call(
+                target.clone(),
+                &call.label,
+                CallRelation::Call,
+                depth,
+                max_depth,
+                visiting,
+            ),
+            CallTarget::Unresolved => {
+                let target = self.resolve_call(caller, &call.syntax);
+                if let Some(target) = target {
+                    self.expand_direct_call(
+                        target,
+                        &call.label,
+                        CallRelation::Call,
+                        depth,
+                        max_depth,
+                        visiting,
+                    )
+                } else {
+                    CallNode {
+                        key: format!("{}://?{}", caller.language, call.syntax.key_fragment()),
+                        label: call.label.clone(),
+                        relation: CallRelation::Call,
+                        children: Vec::new(),
+                    }
+                }
+            }
+        }
+    }
+
+    fn expand_direct_call(
+        &self,
+        target: SymbolId,
+        label: &CallLabel,
+        relation: CallRelation,
+        depth: usize,
+        max_depth: usize,
+        visiting: &mut HashSet<SymbolId>,
+    ) -> CallNode {
+        if self.functions.contains_key(&target) {
+            self.expand(&target, Some(label), relation, depth, max_depth, visiting)
+        } else {
+            CallNode {
+                key: target.to_string(),
+                label: label.clone(),
+                relation,
+                children: Vec::new(),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_dynamic_call(
+        &self,
+        dispatch: &SymbolId,
+        label: &CallLabel,
+        candidates: &[DispatchCandidate],
+        open: bool,
+        depth: usize,
+        max_depth: usize,
+        visiting: &mut HashSet<SymbolId>,
+    ) -> CallNode {
+        let children = if depth >= max_depth {
+            Vec::new()
+        } else {
+            candidates
+                .iter()
+                .map(|candidate| {
+                    self.expand_direct_call(
+                        candidate.target.clone(),
+                        &candidate.label,
+                        CallRelation::DispatchCandidate,
+                        depth + 1,
+                        max_depth,
+                        visiting,
+                    )
+                })
+                .chain(open.then(|| CallNode {
+                    key: format!("{dispatch}#external"),
+                    label: CallLabel::new("? external implementation"),
+                    relation: CallRelation::DispatchCandidate,
+                    children: Vec::new(),
+                }))
+                .collect()
+        };
+
+        CallNode {
+            key: dispatch.to_string(),
+            label: label.clone(),
+            relation: CallRelation::Call,
             children,
         }
     }

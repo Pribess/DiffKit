@@ -82,13 +82,31 @@ impl CallSyntax {
 pub struct CallSite {
     pub syntax: CallSyntax,
     /// Authoritative semantic target supplied by rustc_public, ocaml-index, or
-    /// another language backend. Syntax-only frontends leave this empty and
-    /// the common graph uses conservative path resolution.
-    pub target: Option<SymbolId>,
+    /// another language backend. Syntax-only frontends use `Unresolved` and
+    /// the common graph falls back to conservative path resolution.
+    pub target: CallTarget,
     /// Fully formatted by the owning language frontend. Core rendering never
     /// needs to know whether a call uses `f(x)` or `f x` syntax.
     pub label: CallLabel,
     pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CallTarget {
+    #[default]
+    Unresolved,
+    Direct(SymbolId),
+    Dynamic {
+        dispatch: SymbolId,
+        candidates: Vec<DispatchCandidate>,
+        open: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchCandidate {
+    pub target: SymbolId,
+    pub label: CallLabel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,5 +176,14 @@ pub struct FileAnalysis {
 pub struct CallNode {
     pub key: String,
     pub label: CallLabel,
+    /// The relationship from the parent node to this node. Roots use `Call`.
+    pub relation: CallRelation,
     pub children: Vec<CallNode>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CallRelation {
+    #[default]
+    Call,
+    DispatchCandidate,
 }

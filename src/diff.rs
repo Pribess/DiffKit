@@ -1,4 +1,4 @@
-use crate::model::{CallLabel, CallNode};
+use crate::model::{CallLabel, CallNode, CallRelation};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiffStatus {
@@ -12,7 +12,9 @@ pub enum DiffStatus {
 pub struct DiffNode {
     pub key: String,
     pub label: CallLabel,
+    pub relation: CallRelation,
     pub before_label: Option<CallLabel>,
+    pub before_relation: Option<CallRelation>,
     pub status: DiffStatus,
     pub children: Vec<DiffNode>,
 }
@@ -31,9 +33,14 @@ fn diff_node(before: Option<&CallNode>, after: Option<&CallNode>) -> DiffNode {
         (Some(before), Some(after)) => DiffNode {
             key: after.key.clone(),
             label: after.label.clone(),
-            before_label: (before.label.default != after.label.default)
+            relation: after.relation,
+            before_label: (before.label.default != after.label.default
+                || before.relation != after.relation)
                 .then(|| before.label.clone()),
-            status: if before.label.default == after.label.default {
+            before_relation: (before.relation != after.relation).then_some(before.relation),
+            status: if before.label.default == after.label.default
+                && before.relation == after.relation
+            {
                 DiffStatus::Same
             } else {
                 DiffStatus::Modified
@@ -50,7 +57,9 @@ fn mark_tree(node: &CallNode, status: DiffStatus) -> DiffNode {
     DiffNode {
         key: node.key.clone(),
         label: node.label.clone(),
+        relation: node.relation,
         before_label: None,
+        before_relation: None,
         status,
         children: node
             .children
@@ -114,6 +123,7 @@ mod tests {
         CallNode {
             key: key.to_owned(),
             label,
+            relation: CallRelation::Call,
             children,
         }
     }

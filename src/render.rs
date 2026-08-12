@@ -1,5 +1,6 @@
 use crate::diff::{DiffNode, DiffStatus};
 use crate::engine::DiffReport;
+use crate::model::CallRelation;
 
 pub fn render_report(report: &DiffReport) -> String {
     render_report_with_options(report, &RenderOptions::default())
@@ -59,25 +60,25 @@ fn render_node(
     options: &RenderOptions,
     lines: &mut Vec<String>,
 ) {
-    let branch = if is_root {
-        ""
-    } else if is_last {
-        "└─ "
-    } else {
-        "├─ "
-    };
+    let branch_prefix = branch(node.relation, is_last, is_root);
     match node.status {
         DiffStatus::Same => lines.push(format!(
-            "  {indent}{branch}{}",
+            "  {indent}{branch_prefix}{}",
             node.label.text(options.show_types)
         )),
         DiffStatus::Added => lines.push(color_line(
-            format!("+ {indent}{branch}{}", node.label.text(options.show_types)),
+            format!(
+                "+ {indent}{branch_prefix}{}",
+                node.label.text(options.show_types)
+            ),
             AnsiColor::Green,
             options.color,
         )),
         DiffStatus::Removed => lines.push(color_line(
-            format!("- {indent}{branch}{}", node.label.text(options.show_types)),
+            format!(
+                "- {indent}{branch_prefix}{}",
+                node.label.text(options.show_types)
+            ),
             AnsiColor::Red,
             options.color,
         )),
@@ -87,12 +88,23 @@ fn render_node(
                 .as_ref()
                 .expect("modified nodes carry their previous label");
             lines.push(color_line(
-                format!("- {indent}{branch}{}", before.text(options.show_types)),
+                format!(
+                    "- {indent}{}{}",
+                    branch(
+                        node.before_relation.unwrap_or(node.relation),
+                        is_last,
+                        is_root
+                    ),
+                    before.text(options.show_types)
+                ),
                 AnsiColor::Red,
                 options.color,
             ));
             lines.push(color_line(
-                format!("+ {indent}{branch}{}", node.label.text(options.show_types)),
+                format!(
+                    "+ {indent}{branch_prefix}{}",
+                    node.label.text(options.show_types)
+                ),
                 AnsiColor::Green,
                 options.color,
             ));
@@ -104,7 +116,11 @@ fn render_node(
     } else if is_last {
         format!("{indent}   ")
     } else {
-        format!("{indent}│  ")
+        let continuation = match node.relation {
+            CallRelation::Call => "│  ",
+            CallRelation::DispatchCandidate => "║  ",
+        };
+        format!("{indent}{continuation}")
     };
     for (index, child) in node.children.iter().enumerate() {
         render_node(
@@ -115,6 +131,19 @@ fn render_node(
             options,
             lines,
         );
+    }
+}
+
+fn branch(relation: CallRelation, is_last: bool, is_root: bool) -> &'static str {
+    if is_root {
+        ""
+    } else {
+        match (relation, is_last) {
+            (CallRelation::Call, false) => "├─ ",
+            (CallRelation::Call, true) => "└─ ",
+            (CallRelation::DispatchCandidate, false) => "╠═ ",
+            (CallRelation::DispatchCandidate, true) => "╚═ ",
+        }
     }
 }
 
@@ -138,6 +167,8 @@ fn color_line(line: String, color: AnsiColor, mode: ColorMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::diff_optional;
+    use crate::model::{CallLabel, CallNode, CallRelation};
 
     #[test]
     fn ansi_is_the_default_color_mode() {
@@ -174,6 +205,56 @@ mod tests {
                 ColorMode::Plain
             ),
             "+ └─ commit()"
+        );
+    }
+
+    #[test]
+    fn renders_dispatch_candidates_with_a_complete_double_line_relation() {
+        let tree = CallNode {
+            key: "rust://run".to_owned(),
+            label: CallLabel::new("run(store, order)"),
+            relation: CallRelation::Call,
+            children: vec![CallNode {
+                key: "rust://Store::save".to_owned(),
+                label: CallLabel::new("dyn Store::save(order)"),
+                relation: CallRelation::Call,
+                children: vec![
+                    CallNode {
+                        key: "rust://Postgres::save".to_owned(),
+                        label: CallLabel::new("Postgres::save(order)"),
+                        relation: CallRelation::DispatchCandidate,
+                        children: vec![CallNode {
+                            key: "rust://sql::insert".to_owned(),
+                            label: CallLabel::new("sql::insert(order)"),
+                            relation: CallRelation::Call,
+                            children: Vec::new(),
+                        }],
+                    },
+                    CallNode {
+                        key: "rust://S3::save".to_owned(),
+                        label: CallLabel::new("S3::save(order)"),
+                        relation: CallRelation::DispatchCandidate,
+                        children: vec![CallNode {
+                            key: "rust://aws::put_object".to_owned(),
+                            label: CallLabel::new("aws::put_object(order)"),
+                            relation: CallRelation::Call,
+                            children: Vec::new(),
+                        }],
+                    },
+                ],
+            }],
+        };
+        let diff = diff_optional(Some(&tree), Some(&tree)).unwrap();
+
+        assert_eq!(
+            render_diff_tree_with_options(
+                &diff,
+                &RenderOptions {
+                    show_types: false,
+                    color: ColorMode::Plain,
+                },
+            ),
+            "  run(store, order)\n  └─ dyn Store::save(order)\n     ╠═ Postgres::save(order)\n     ║  └─ sql::insert(order)\n     ╚═ S3::save(order)\n        └─ aws::put_object(order)"
         );
     }
 }

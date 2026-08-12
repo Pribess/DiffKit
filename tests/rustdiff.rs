@@ -127,9 +127,9 @@ fn keeps_generic_arguments_on_rust_callsite_labels() {
 fn semantic_mode_uses_concrete_generic_and_trait_targets() {
     let report = rustdiff_sources(
         "before.rs",
-        include_str!("../examples/rust-semantic/before.rs"),
+        include_str!("../examples/rust/before.rs"),
         "after.rs",
-        include_str!("../examples/rust-semantic/after.rs"),
+        include_str!("../examples/rust/after.rs"),
         &RustDiffOptions {
             entries: vec!["run<Postgres>".to_owned(), "run<S3>".to_owned()],
             max_depth: 8,
@@ -182,5 +182,76 @@ fn semantic_entry_instantiates_an_uncalled_generic_function() {
     assert_eq!(
         render_plain(&report),
         "rustdiff before.rs → after.rs\n\n  run<Postgres>(storage, order)\n  └─ Postgres::save(order)\n     ├─ write(order)\n+    └─ commit()"
+    );
+}
+
+#[test]
+fn semantic_mode_renders_reachable_dyn_candidates_as_double_line_relations() {
+    let before = r#"
+        #[derive(Clone, Copy)]
+        pub struct Order;
+        trait Store { fn save(&self, order: Order); }
+        struct Postgres;
+        impl Store for Postgres {
+            fn save(&self, order: Order) { sql::insert(order); }
+        }
+        struct S3;
+        impl Store for S3 {
+            fn save(&self, order: Order) { aws::put_object(order); }
+        }
+        fn run(storage: &dyn Store, order: Order) { storage.save(order); }
+        pub fn entry(order: Order) { run(&Postgres, order); }
+        mod sql {
+            use super::Order;
+            pub fn insert(_: Order) {}
+        }
+        mod aws {
+            use super::Order;
+            pub fn put_object(_: Order) {}
+        }
+    "#;
+    let after = r#"
+        #[derive(Clone, Copy)]
+        pub struct Order;
+        trait Store { fn save(&self, order: Order); }
+        struct Postgres;
+        impl Store for Postgres {
+            fn save(&self, order: Order) { sql::insert(order); }
+        }
+        struct S3;
+        impl Store for S3 {
+            fn save(&self, order: Order) { aws::put_object(order); }
+        }
+        fn run(storage: &dyn Store, order: Order) { storage.save(order); }
+        pub fn entry(order: Order) {
+            run(&Postgres, order);
+            run(&S3, order);
+        }
+        mod sql {
+            use super::Order;
+            pub fn insert(_: Order) {}
+        }
+        mod aws {
+            use super::Order;
+            pub fn put_object(_: Order) {}
+        }
+    "#;
+
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &RustDiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+            mode: RustAnalysisMode::Semantic,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_plain(&report),
+        "rustdiff before.rs → after.rs\n\n  run(storage, order)\n  └─ dyn Store::save(order)\n     ╠═ Postgres::save(order)\n     ║  └─ sql::insert(order)\n+    ╚═ S3::save(order)\n+       └─ aws::put_object(order)"
     );
 }

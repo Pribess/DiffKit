@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -8,8 +8,11 @@ use proc_macro2::Span;
 use quote::ToTokens;
 use rustc_public::CompilerError;
 use rustc_public::crate_def::CrateDef;
-use rustc_public::mir::TerminatorKind;
-use rustc_public::mir::mono::Instance;
+use rustc_public::mir::mono::{Instance, InstanceKind};
+use rustc_public::mir::{CastKind, PointerCoercion, Rvalue, StatementKind, TerminatorKind};
+use rustc_public::ty::{
+    AssocContainer, ExistentialTraitRef, RigidTy, TraitRef, Ty, TyKind, VtblEntry,
+};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
@@ -19,8 +22,8 @@ use syn::{
 
 use super::{FileContext, FrontendResult, LanguageFrontend};
 use crate::model::{
-    CallLabel, CallSite, CallSyntax, FileAnalysis, FunctionInfo, LanguageFact, LanguageId,
-    SourceSpan, SymbolId,
+    CallLabel, CallSite, CallSyntax, CallTarget, DispatchCandidate, FileAnalysis, FunctionInfo,
+    LanguageFact, LanguageId, SourceSpan, SymbolId,
 };
 
 #[derive(Default)]
@@ -219,10 +222,30 @@ struct SemanticFunction {
 
 #[derive(Debug)]
 struct SemanticCall {
-    target_key: String,
-    target_display: String,
+    target: SemanticCallTarget,
     definition_name: String,
     span: SourceSpan,
+}
+
+#[derive(Debug)]
+enum SemanticCallTarget {
+    Direct {
+        key: String,
+        display: String,
+    },
+    Dynamic {
+        dispatch_id: usize,
+        key: String,
+        display: String,
+        candidates: Vec<SemanticDispatchCandidate>,
+        open: bool,
+    },
+}
+
+#[derive(Debug)]
+struct SemanticDispatchCandidate {
+    key: String,
+    display: String,
 }
 
 fn collect_rustc_program(path: &Path) -> FrontendResult<SemanticProgram> {
@@ -266,60 +289,227 @@ fn collect_instances() -> SemanticProgram {
         .collect::<VecDeque<_>>();
     let mut visited = HashSet::new();
     let mut functions = Vec::new();
+    let mut observed_vtables = Vec::new();
+    let mut dynamic_instances = Vec::new();
+    let trait_method_implementations = trait_method_implementations();
 
-    while let Some(instance) = queue.pop_front() {
-        if !visited.insert(instance) {
-            continue;
-        }
-        let Some(body) = instance.body() else {
-            continue;
-        };
-
-        let mut calls = Vec::new();
-        for block in &body.blocks {
-            let TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+    loop {
+        while let Some(instance) = queue.pop_front() {
+            if !visited.insert(instance) {
                 continue;
-            };
-            let Ok(function_type) = func.ty(body.locals()) else {
-                continue;
-            };
-            let function_kind = function_type.kind();
-            let Some((definition, arguments)) = function_kind.fn_def() else {
-                continue;
-            };
-            let Ok(target) = Instance::resolve(definition, arguments) else {
+            }
+            let Some(body) = instance.body() else {
                 continue;
             };
 
-            calls.push(SemanticCall {
-                target_key: normalize_instance_key(&target.name()),
-                target_display: normalize_instance_display(&target.name()),
-                definition_name: target.def.name(),
-                span: rustc_source_span(block.terminator.span),
+            collect_observed_vtables(&body, &mut observed_vtables);
+
+            let mut calls = Vec::new();
+            for block in &body.blocks {
+                let TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+                    continue;
+                };
+                let Ok(function_type) = func.ty(body.locals()) else {
+                    continue;
+                };
+                let function_kind = function_type.kind();
+                let Some((definition, arguments)) = function_kind.fn_def() else {
+                    continue;
+                };
+                let Ok(target) = Instance::resolve(definition, arguments) else {
+                    continue;
+                };
+                let name = target.name();
+                let semantic_target = match target.kind {
+                    InstanceKind::Virtual { .. } => {
+                        let dispatch_id = dynamic_instances.len();
+                        dynamic_instances.push(target);
+                        SemanticCallTarget::Dynamic {
+                            dispatch_id,
+                            key: normalize_instance_key(&name),
+                            display: normalize_instance_display(&name),
+                            candidates: Vec::new(),
+                            open: false,
+                        }
+                    }
+                    _ => SemanticCallTarget::Direct {
+                        key: normalize_instance_key(&name),
+                        display: normalize_instance_display(&name),
+                    },
+                };
+
+                calls.push(SemanticCall {
+                    target: semantic_target,
+                    definition_name: target.def.name(),
+                    span: rustc_source_span(block.terminator.span),
+                });
+
+                if !matches!(target.kind, InstanceKind::Virtual { .. })
+                    && target.def.krate().is_local
+                    && target.has_body()
+                {
+                    queue.push_back(target);
+                }
+            }
+            calls.sort_by_key(|call| {
+                (
+                    call.span.start_line,
+                    call.span.start_column,
+                    call.span.end_line,
+                    call.span.end_column,
+                )
             });
 
-            if target.def.krate().is_local && target.has_body() {
-                queue.push_back(target);
-            }
+            functions.push(SemanticFunction {
+                key: normalize_instance_key(&instance.name()),
+                display: normalize_instance_display(&instance.name()),
+                body_span: rustc_source_span(body.span),
+                calls,
+            });
         }
-        calls.sort_by_key(|call| {
-            (
-                call.span.start_line,
-                call.span.start_column,
-                call.span.end_line,
-                call.span.end_column,
-            )
-        });
 
-        functions.push(SemanticFunction {
-            key: normalize_instance_key(&instance.name()),
-            display: normalize_instance_display(&instance.name()),
-            body_span: rustc_source_span(body.span),
-            calls,
-        });
+        resolve_dynamic_candidates(
+            &mut functions,
+            &dynamic_instances,
+            &observed_vtables,
+            &trait_method_implementations,
+            &visited,
+            &mut queue,
+        );
+        if queue.is_empty() {
+            break;
+        }
     }
     functions.sort_by(|left, right| left.key.cmp(&right.key));
     SemanticProgram { functions }
+}
+
+fn collect_observed_vtables(body: &rustc_public::mir::Body, observed: &mut Vec<TraitRef>) {
+    for block in &body.blocks {
+        for statement in &block.statements {
+            let StatementKind::Assign(
+                _,
+                Rvalue::Cast(
+                    CastKind::PointerCoercion(PointerCoercion::Unsize),
+                    operand,
+                    target_ty,
+                ),
+            ) = &statement.kind
+            else {
+                continue;
+            };
+            let Ok(source_ty) = operand.ty(body.locals()) else {
+                continue;
+            };
+            let Some((concrete_ty, principal)) = dyn_coercion(source_ty, *target_ty) else {
+                continue;
+            };
+            let trait_ref = TraitRef::new(principal.def_id, concrete_ty, &principal.generic_args);
+            if !observed.contains(&trait_ref) {
+                observed.push(trait_ref);
+            }
+        }
+    }
+}
+
+fn dyn_coercion(source: Ty, target: Ty) -> Option<(Ty, ExistentialTraitRef)> {
+    let target_kind = target.kind();
+    if let Some(principal) = target_kind.trait_principal() {
+        // A trait upcast (`dyn Child` -> `dyn Parent`) does not reveal a
+        // concrete implementation. Only thin-to-wide coercions contribute an
+        // RTA candidate here.
+        return (!source.kind().is_trait()).then_some((source, principal.value));
+    }
+
+    match (source.kind(), target_kind) {
+        (
+            TyKind::RigidTy(RigidTy::Ref(_, source, _)),
+            TyKind::RigidTy(RigidTy::Ref(_, target, _)),
+        )
+        | (
+            TyKind::RigidTy(RigidTy::RawPtr(source, _)),
+            TyKind::RigidTy(RigidTy::RawPtr(target, _)),
+        ) => dyn_coercion(source, target),
+        (
+            TyKind::RigidTy(RigidTy::Adt(source_def, source_args)),
+            TyKind::RigidTy(RigidTy::Adt(target_def, target_args)),
+        ) if source_def == target_def => source_args
+            .0
+            .iter()
+            .zip(&target_args.0)
+            .filter_map(|(source, target)| Some((*source.ty()?, *target.ty()?)))
+            .find_map(|(source, target)| dyn_coercion(source, target)),
+        _ => None,
+    }
+}
+
+fn trait_method_implementations() -> HashMap<rustc_public::DefId, rustc_public::DefId> {
+    rustc_public::all_trait_impls()
+        .into_iter()
+        .flat_map(|implementation| implementation.associated_items())
+        .filter_map(|item| match item.container {
+            AssocContainer::TraitImpl(trait_item) => {
+                Some((item.def_id.def_id(), trait_item.def_id()))
+            }
+            AssocContainer::InherentImpl | AssocContainer::Trait => None,
+        })
+        .collect()
+}
+
+fn resolve_dynamic_candidates(
+    functions: &mut [SemanticFunction],
+    dynamic_instances: &[Instance],
+    observed_vtables: &[TraitRef],
+    trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
+    visited: &HashSet<Instance>,
+    queue: &mut VecDeque<Instance>,
+) {
+    for call in functions
+        .iter_mut()
+        .flat_map(|function| &mut function.calls)
+    {
+        let SemanticCallTarget::Dynamic {
+            dispatch_id,
+            candidates,
+            ..
+        } = &mut call.target
+        else {
+            continue;
+        };
+        let dispatch = dynamic_instances[*dispatch_id];
+        let InstanceKind::Virtual { idx } = dispatch.kind else {
+            continue;
+        };
+        let trait_method = dispatch.def.def_id();
+
+        for trait_ref in observed_vtables {
+            let Some(VtblEntry::Method(candidate)) = trait_ref.vtable_entry(idx) else {
+                continue;
+            };
+            let candidate_method = candidate.def.def_id();
+            let implements_dispatch = candidate_method == trait_method
+                || trait_method_implementations.get(&candidate_method) == Some(&trait_method);
+            if !implements_dispatch {
+                continue;
+            }
+
+            let key = normalize_instance_key(&candidate.name());
+            if candidates.iter().any(|existing| existing.key == key) {
+                continue;
+            }
+            candidates.push(SemanticDispatchCandidate {
+                key,
+                display: normalize_instance_display(&candidate.name()),
+            });
+            if candidate.def.krate().is_local
+                && candidate.has_body()
+                && !visited.contains(&candidate)
+            {
+                queue.push_back(candidate);
+            }
+        }
+        candidates.sort_by(|left, right| left.key.cmp(&right.key));
+    }
 }
 
 fn merge_semantic_program(syntax: FileAnalysis, semantic: SemanticProgram) -> FileAnalysis {
@@ -345,9 +535,35 @@ fn merge_semantic_program(syntax: FileAnalysis, semantic: SemanticProgram) -> Fi
                 if let Some(index) = match_index {
                     claimed_calls.insert(index);
                     let semantic_call = &semantic_function.calls[index];
-                    resolved.target = Some(semantic_symbol(semantic_call.target_key.clone()));
-                    resolved.label =
-                        replace_label_callee(&resolved.label, &semantic_call.target_display);
+                    match &semantic_call.target {
+                        SemanticCallTarget::Direct { key, display } => {
+                            resolved.target = CallTarget::Direct(semantic_symbol(key.clone()));
+                            resolved.label = replace_label_callee(&resolved.label, display);
+                        }
+                        SemanticCallTarget::Dynamic {
+                            key,
+                            display,
+                            candidates,
+                            open,
+                            ..
+                        } => {
+                            resolved.target = CallTarget::Dynamic {
+                                dispatch: semantic_symbol(key.clone()),
+                                candidates: candidates
+                                    .iter()
+                                    .map(|candidate| DispatchCandidate {
+                                        target: semantic_symbol(candidate.key.clone()),
+                                        label: replace_label_callee(
+                                            &resolved.label,
+                                            &candidate.display,
+                                        ),
+                                    })
+                                    .collect(),
+                                open: *open,
+                            };
+                            resolved.label = replace_label_callee(&resolved.label, display);
+                        }
+                    }
                 }
                 resolved
             })
@@ -890,7 +1106,7 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
         if let Some(parts) = callable_path(&node.func) {
             self.calls.push(CallSite {
                 syntax: CallSyntax::Path(parts),
-                target: None,
+                target: CallTarget::Unresolved,
                 label: CallLabel::new(call_expression_label(node)),
                 span: source_span(self.file, node.span()),
             });
@@ -910,7 +1126,7 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
         };
         self.calls.push(CallSite {
             syntax,
-            target: None,
+            target: CallTarget::Unresolved,
             label: CallLabel::new(method_call_label(node)),
             span: source_span(self.file, node.span()),
         });

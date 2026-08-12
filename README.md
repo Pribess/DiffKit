@@ -32,13 +32,13 @@ receiver variable from source:
 
 ```sh
 cargo run -- \
-  examples/rust-semantic/before.rs \
-  examples/rust-semantic/after.rs \
+  examples/rust/before.rs \
+  examples/rust/after.rs \
   --semantic -e 'run<Postgres>' -e 'run<S3>'
 ```
 
 ```diff
-rustdiff examples/rust-semantic/before.rs → examples/rust-semantic/after.rs
+rustdiff examples/rust/before.rs → examples/rust/after.rs
 
   run<Postgres>(storage, order)
   ├─ validate(order)
@@ -53,6 +53,31 @@ rustdiff examples/rust-semantic/before.rs → examples/rust-semantic/after.rs
   ├─ S3::save(order)
   │  ├─ aws::sign(order)
 + │  └─ aws::put_object(order)
+  └─ finalize(order)
+```
+
+Trait-object dispatch is a call node whose possible vtable targets are joined
+with a complete double-line relation. Calls inside each implementation return
+to ordinary single-line branches:
+
+```sh
+cargo run -- examples/rust/before.rs examples/rust/after.rs \
+  --semantic -e run_dyn
+```
+
+```diff
+rustdiff examples/rust/before.rs → examples/rust/after.rs
+
+  run_dyn(storage, order)
+  ├─ validate(order)
+  ├─ dyn Store::save(order)
+  │  ╠═ Postgres::save(order)
++ │  ║  ├─ sql::begin()
+  │  ║  ├─ sql::insert(order)
++ │  ║  └─ sql::commit()
++ │  ╚═ S3::save(order)
++ │     ├─ aws::sign(order)
++ │     └─ aws::put_object(order)
   └─ finalize(order)
 ```
 
@@ -100,7 +125,8 @@ built `diffkit` binary can also run directly outside `cargo run`.
 - `language::LanguageFrontend`: parser-specific ASTs stay inside `rust.rs` and
   `ocaml.rs` and are lowered into common IR.
 - `model`: semantic symbol keys are separate from language-owned `CallLabel`s.
-  Rust emits `save(order)` while OCaml emits `save order`.
+  `CallTarget` represents unresolved, direct, and dynamic targets; Rust emits
+  `save(order)` while OCaml emits `save order`.
 - `graph`: conservative name resolution and cycle-safe call tree expansion.
 - `diff`: LCS alignment uses semantic keys; changed call-site arguments are
   represented as modified labels without turning labels into symbol identity.
@@ -112,5 +138,5 @@ The current OCaml slice uses `tree-sitter-ocaml` for function/application spans
 and exact source labels. `CallSite::target` is the semantic-resolution seam for
 the `ocaml-index` adapter; until that adapter is connected, OCaml resolution is
 conservative and limited to unambiguous source paths. Rust semantic mode fills
-that same field from the concrete `rustc_public::mir::mono::Instance` selected
-for each explicit source call.
+that same field from concrete `rustc_public::mir::mono::Instance`s and records
+virtual calls with the reachable vtable candidates observed in MIR coercions.

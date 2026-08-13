@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct LanguageId(pub String);
 
@@ -50,7 +52,7 @@ impl fmt::Display for SymbolId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceSpan {
     pub file: PathBuf,
     pub start_line: usize,
@@ -81,7 +83,7 @@ impl CallSyntax {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallSite {
     pub syntax: CallSyntax,
-    /// Authoritative semantic target supplied by rustc_public, ocaml-index, or
+    /// Authoritative semantic target supplied by rustc_public, OCaml Typedtree, or
     /// another language backend. Syntax-only frontends use `Unresolved` and
     /// the common graph falls back to conservative path resolution.
     pub target: CallTarget,
@@ -99,8 +101,21 @@ pub enum CallTarget {
     Dynamic {
         dispatch: SymbolId,
         candidates: Vec<DispatchCandidate>,
-        open: bool,
+        resolution: DispatchResolution,
     },
+}
+
+/// How completely a language backend resolved an indirect call site.
+///
+/// Candidate names are emitted only when the backend has evidence that the
+/// callable value can reach the call site. `Partial` keeps those proven
+/// candidates while recording that another, opaque source may also reach it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DispatchResolution {
+    #[default]
+    Complete,
+    Partial,
+    Unresolved,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,4 +201,8 @@ pub enum CallRelation {
     #[default]
     Call,
     DispatchCandidate,
+    /// A recursive call to an ancestor already visible in the current tree.
+    /// The node key identifies that ancestor; renderers should draw an edge
+    /// back to it rather than repeating its label.
+    BackEdge,
 }

@@ -13,8 +13,10 @@ pub struct FileContext<'a> {
     pub module: &'a [String],
 }
 
-/// A language frontend owns its concrete parser and lowers directly into DiffKit IR.
-/// Parser-specific AST types never leak into the core engine.
+/// A language frontend owns its parser/compiler representation and emits the
+/// small semantic call-graph result consumed by DiffKit. This is not a shared
+/// compiler AST: language-native AST, Typedtree, and MIR types never leak into
+/// the common engine.
 pub trait LanguageFrontend: Send + Sync {
     fn language(&self) -> LanguageId;
     fn extensions(&self) -> &'static [&'static str];

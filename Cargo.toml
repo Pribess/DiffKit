@@ -4,6 +4,24 @@ version = "0.1.0"
 edition = "2024"
 description = "Semantic call-tree diffs for polyglot codebases"
 license = "MIT"
+repository = "https://github.com/Pribess/DiffKit"
+readme = "README.md"
+keywords = ["diff", "call-graph", "semantic-analysis", "rust", "ocaml"]
+categories = ["development-tools", "command-line-utilities"]
+include = [
+    "/.cargo/config.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/build.rs",
+    "/examples/**",
+    "/rust-toolchain.toml",
+    "/src/**",
+    "/support/**",
+    "/tests/cli.rs",
+    "/tests/ocamldiff.rs",
+    "/tests/rustdiff.rs",
+    "/tests/fixtures/closure.rs",
+]
 default-run = "diffkit"
 
 [dependencies]

@@ -16,12 +16,7 @@ result combines compiler-accurate targets, explicit dynamic-dispatch
 completeness, source-shaped output, and fast repeat runs through Git-aware
 semantic caches.
 
-```text
-  checkout(total)
-  ├─ validate(total)
-  └─ charge<Postgres>(total)
-+    └─ audit(total)
-```
+![DiffKit colored terminal output](https://raw.githubusercontent.com/Pribess/DiffKit/main/docs/terminal.svg)
 
 ## Installation
 
@@ -86,6 +81,39 @@ diffkit --types --color plain
 
 # Show cache timings and resolution evidence
 diffkit --verbose
+```
+
+## Examples
+
+Concrete generic paths stay separate:
+
+```diff
+  run<Postgres>(Postgres)
+  └─ Postgres::save()
++    └─ sql::commit()
+
+  run<S3>(S3)
+  └─ S3::save()
++    └─ aws::put_object()
+```
+
+Dynamic-dispatch candidates use double-line edges and preserve incomplete
+resolution:
+
+```diff
+  dyn Store::save() [partial]
+  ╠═ Postgres::save()
++ ╠═ S3::save()
+  ╚═ … unresolved targets
+```
+
+OCaml keeps its application syntax:
+
+```diff
+  run order
+  ├─ validate order
+  ├─ Store.save order
++ └─ audit order
 ```
 
 ## Command reference

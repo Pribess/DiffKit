@@ -1,29 +1,37 @@
 # DiffKit
 
-DiffKit shows semantic call-tree changes instead of changed source lines. It is
-Git-based by default, understands a single-file forest when asked, and has one
-semantic analysis pipeline—there is no `--syntax`/`--semantic` mode split.
+DiffKit turns source changes into semantic call-tree diffs. It analyzes both
+sides of a Git or file comparison, follows calls from every graph root, and
+keeps the paths affected by the change.
 
-Rust and OCaml are implemented first. Language compilers keep their native
-representations internally and emit only a compact semantic call graph to the
-shared tree/diff/renderer. DiffKit is one library and one binary, not one crate
-per language.
+Rust and OCaml are supported today. Each language backend uses its compiler's
+semantic representation and emits a compact call graph for the shared diff and
+renderer.
+
+```text
+  checkout(total)
+  ├─ validate(total)
+  └─ charge<Postgres>(total)
++    └─ audit(total)
+```
 
 ## Installation
 
-DiffKit currently supports macOS and Linux. Rust analysis uses compiler APIs
-from the pinned `nightly-2026-05-06` toolchain, including the `rustc-dev`
-component:
+DiffKit currently supports macOS and Linux. The crates.io package is named
+`diffkit-cli`; the installed executable is `diffkit`.
+
+Rust analysis uses compiler APIs from the pinned `nightly-2026-05-06`
+toolchain:
 
 ```sh
 rustup toolchain install nightly-2026-05-06 \
   --profile minimal \
   --component rustc-dev \
   --component llvm-tools-preview
-cargo +nightly-2026-05-06 install --locked diffkit
+cargo +nightly-2026-05-06 install --locked diffkit-cli
 ```
 
-To install the current source checkout instead:
+To install from source:
 
 ```sh
 git clone https://github.com/Pribess/DiffKit.git
@@ -31,47 +39,48 @@ cd DiffKit
 cargo install --locked --path .
 ```
 
-Rust-only projects need no additional tools. For compiler-backed OCaml
-analysis, install OCaml and Dune in the active environment; DiffKit compiles its
-small `compiler-libs.common` adapter against that OCaml compiler at runtime.
+Rust projects require no additional tools. OCaml projects get compiler-backed
+analysis when OCaml and Dune are available in the active environment.
 
 ## Quick start
 
-Run DiffKit inside a Git repository to compare `HEAD` with the complete current
-worktree:
+Run `diffkit` inside a Git repository to compare `HEAD` with the current
+worktree, including staged, unstaged, and untracked files:
 
 ```sh
 cd your-project
 diffkit
 ```
 
-Common forms are:
+Common commands:
 
 ```sh
-# Only changes selected by a Git pathspec
+# Limit the Git comparison with a pathspec
 diffkit -- src/service.rs
 
-# One commit against its first parent
+# Compare one commit with its first parent
 diffkit git 71b148d
 
-# Two explicit revisions
+# Compare two revisions
 diffkit git v1.2.0 v1.3.0
 
-# Display the semantic forest rooted in one source file
+# Show the semantic call forest for one file
 diffkit file src/service.rs
 
-# Compare two files and select a concrete generic entry
-diffkit file old.rs new.rs -e 'run<Postgres>'
+# Compare two file-scoped forests
+diffkit file old.rs new.rs
 
-# Add argument types, remove ANSI colors, and inspect cache/resolution details
-diffkit --types --color plain --verbose
+# Select a concrete generic entry
+diffkit file src/service.rs -e 'run<Postgres>'
+
+# Add argument types and use plain output
+diffkit --types --color plain
+
+# Show cache timings and resolution evidence
+diffkit --verbose
 ```
 
-The first Rust project analysis runs Cargo and `rustc_public`; subsequent runs
-reuse semantic endpoint caches under `target/diffkit-semantic`. DiffKit never
-modifies the analyzed working tree.
-
-## CLI
+## Command reference
 
 ```text
 diffkit [OPTIONS] [-- PATHSPEC...]
@@ -80,81 +89,68 @@ diffkit file FILE [OPTIONS]
 diffkit file BEFORE AFTER [OPTIONS]
 ```
 
-Git forms mean:
+Git comparisons:
 
-- `diffkit`: `HEAD` versus the current worktree, including staged, unstaged,
-  and untracked files.
-- `diffkit git REV`: `REV^` versus `REV`.
-- `diffkit git BEFORE AFTER`: two explicit Git revisions.
-- `-- PATHSPEC...`: analyze the full project context but restrict the after
-  snapshot to changes in those paths.
+- `diffkit` compares `HEAD` with the current worktree.
+- `diffkit git REV` compares `REV^` with `REV`.
+- `diffkit git BEFORE AFTER` compares two explicit revisions.
+- `-- PATHSPEC...` keeps full project context while selecting changes from the
+  requested paths.
 
-The old positional snapshot form is intentionally absent. Use `diffkit file`
-for files and `diffkit git` for revisions.
-
-Useful options:
+Options:
 
 ```text
 -e, --entry SYMBOL    Select an entry; repeat for multiple entries
-    --types           Put inferred/concrete argument types on the same line
+    --types           Add inferred or concrete argument types
     --color ansi      ANSI colors (default)
-    --color plain     No terminal control sequences
+    --color plain     Plain text without terminal control sequences
     --max-depth N     Maximum displayed call depth (default: 8)
--l, --language LANG   Override extension-based Rust/OCaml selection
--v, --verbose         Show analysis progress, cache hit/miss, and timings
+-l, --language LANG   Select Rust or OCaml explicitly
+-v, --verbose         Show analysis, cache, timing, and resolution details
 ```
 
-Concrete generic arguments that select an analyzed local specialization are
-always shown. External leaves keep source turbofish arguments and closure
-identity such as `filter_map<λ#1>`, but omit other rustc-only implementation
-details such as `iter<impl [T]>`. Argument values/names are shown by default,
-argument types are opt-in, and return types are not printed. Normal output
-contains no analysis-progress line.
+Argument expressions are visible in the default output. Concrete generic
+arguments remain visible because they identify distinct call trees. `--types`
+adds argument types to the same lines.
 
-## Rust examples
+## Rust
 
-```sh
-diffkit file src/service.rs --color plain
-```
+DiffKit combines source-shaped labels with Cargo's real build graph and
+`rustc_public` typed MIR. Generic instances and trait dispatch therefore follow
+the concrete context established by their callers, including calls across
+workspace crates.
 
 ```text
-src/service.rs
-
-  entry(order)
-  └─ run<Postgres>(&Postgres, order)
-     └─ Postgres::save(order)
+entry(order)
+└─ run<Postgres>(&Postgres, order)
+   ├─ validate(order)
+   ├─ Postgres::save(order)
+   │  ├─ sql::begin()
+   │  └─ sql::commit()
+   └─ finalize()
 ```
 
-`file FILE` uses the surrounding Cargo project to resolve that leaf, but does
-not expand a function body located outside `FILE`. Comparing two files compares
-two forests. A root with the same semantic identity is diffed internally; an
-unmatched old root is a removed tree and an unmatched new root is an added
-tree. DiffKit does not guess that differently named roots are renames.
-
-An unobserved generic can be requested explicitly:
-
-```sh
-diffkit file src/service.rs -e 'detached<Postgres>'
-```
-
-DiffKit makes a temporary workspace copy, injects a hidden instantiation seed
-in the declaring module, runs Cargo/rustc, removes the seed nodes, and maps
-source locations back to the original project. The working tree is untouched.
-
-An uninstantiated generic is still represented from its source body. Its open
-type parameter is kept on the tree until a connected caller provides a concrete
-context:
+An open generic definition keeps its type parameter until a caller supplies a
+concrete instance:
 
 ```text
 run<T: Store>(storage)
 └─ T::save()
 ```
 
-Concrete contexts are propagated through workspace-crate calls, so a root in
-one crate can specialize a generic body or trait-object receiver declared in
-another analyzed crate.
+An explicit entry can request a concrete instance that Cargo has not otherwise
+instantiated:
 
-Trait-object calls use double lines only for the dispatch relation:
+```sh
+diffkit file src/service.rs -e 'detached<Postgres>'
+```
+
+DiffKit performs that analysis in an isolated temporary workspace and maps the
+result back to the original source locations.
+
+### Dynamic dispatch
+
+Double lines connect a dynamic call site to its resolved candidates:
 
 ```text
 run(storage, order)
@@ -165,7 +161,7 @@ run(storage, order)
       └─ aws::put_object(order)
 ```
 
-Resolution has three explicit states:
+Candidate completeness is visible on the call site:
 
 ```text
 dyn Store::save(order)
@@ -178,66 +174,40 @@ dyn Store::save(order) [partial]
 dyn Store::save(order) [unresolved]
 ```
 
-`… unresolved targets` appears only for a partial result. Rust trait-object
-provenance is propagated through MIR places, control-flow joins, direct
-arguments, direct return values, aliases, and typed heap/container boundaries.
-Calls to the same function are specialized by their incoming dyn context, so
-`run_dyn(&Postgres)` does not acquire an `S3` candidate merely because another
-caller passes one. A value entering through an actual graph root is opaque;
-visibility (`pub`) by itself never means “external value.” A join of proven
-local values and opaque input is partial, while unsupported or externally
-opaque flow with no proven target is unresolved. DiffKit never substitutes a
-component-wide RTA set for a known receiver flow.
+Trait-object provenance flows through MIR places, branches, arguments, return
+values, aliases, and typed heap or container boundaries. Each incoming context
+gets its own specialization, which keeps candidate sets local to the callers
+that establish them.
 
-A typed function-pointer call is distinct from an unknown name:
+Typed function-pointer calls have a separate marker:
 
 ```text
 callback(value) [indirect]
 ```
 
-With `--verbose`, dynamic and indirect sites also report their evidence
-(`exact-flow` or `closed-set`) and structured unresolved causes such as opaque
-input, external memory, or a function pointer. Ordinary calls to external
-libraries remain normal leaves and do not flood these diagnostics.
+`--verbose` reports evidence such as `exact-flow` or `closed-set`, together
+with unresolved causes such as opaque input, external memory, and function
+pointers.
 
-Closures retain the source variable and expose their body:
+### Closures, async, and recursion
 
-```text
-run(order)
-└─ λpersist(order)
-   └─ write(value)
-```
-
-A closure expression passed to a generic call becomes part of that concrete
-call identity instead of being serialized into one source line:
-
-```text
-├─ values.iter()
-├─ filter_map<λ#1>()
-└─ collect()
-```
-
-Distinct anonymous closures remain distinct concrete instances and connect to
-their own bodies:
+Named and anonymous closures have compact lambda nodes whose children contain
+their calls:
 
 ```text
 run()
-├─ apply<λ#1>()
-│  └─ λ#1()
-│     └─ db::save()
-└─ apply<λ#2>()
-   └─ λ#2()
+├─ λpersist()
+│  └─ db::save()
+└─ apply<λ#1>()
+   └─ λ#1()
       └─ cache::save()
 ```
 
-A named closure inside a generic parent inherits the parent's concrete
-arguments, for example `λsave<Postgres>()`. Async closures use the same lambda
-shape; polling machinery remains hidden. Internal closure identities are
-structural, while `λ#N` is only a source-facing display label, so inserting an
-unrelated closure does not turn an existing closure subtree into a removal and
-addition.
+Closure identities remain stable across unrelated insertions. Closures inside
+generic functions inherit the parent's concrete arguments, and async functions
+retain the same source-level tree shape.
 
-Recursion is a real back-edge, not a repeated fake subtree:
+Recursive calls connect directly back to the active ancestor:
 
 ```text
 a() ◀────┐
@@ -245,13 +215,12 @@ a() ◀────┐
    └─────┘
 ```
 
-Async functions use source-logical calls. Poll/runtime machinery is not shown.
-Implicit calls such as drops and deref coercions are intentionally outside the
-call graph.
+The graph covers explicit source-level calls. Compiler-generated drop glue and
+deref coercions are outside its current scope.
 
-## OCaml examples
+## OCaml
 
-OCaml labels stay in OCaml application syntax:
+OCaml output keeps native application syntax:
 
 ```text
 run order
@@ -261,7 +230,7 @@ run order
 └─ finalize order
 ```
 
-Local functions are explicit closure nodes:
+Local functions are represented as callable closure nodes:
 
 ```text
 run order
@@ -269,102 +238,84 @@ run order
    └─ write order
 ```
 
-Function parameters are propagated per connected call context. Two callers
-that pass different functions no longer contaminate one another's candidate
-sets. A proven function value is a double-line candidate; a single flow that
-joins proven and opaque values is partial and uses the same
-`… unresolved targets` tail. A root-only opaque parameter and an object method
-with no proven receiver target are `[unresolved]`.
+Function values flow through parameters per connected caller context. Proven
+targets use the same double-line relation as Rust dispatch, and joins with an
+opaque value are marked `[partial]`.
 
-For a Dune project, DiffKit runs `dune build @check`, reads the generated
-`.cmt` files with the active switch's official `compiler-libs.common`
-(`Cmt_format`/Typedtree), and merges resolved `Path.t` identities with source
-labels. The small OCaml adapter is compiled against the active compiler because
-Typedtree is deliberately version-coupled. Missing `dune`/`ocamlc` or an
-incompatible compiler-libs API is an analysis error; DiffKit does not silently
-switch a Dune project to a weaker mode. For standalone compilable `.ml` files,
-the same compiler-libs adapter is used through a temporary `.cmt`; inferred
-curried argument types are available to `--types`. If no OCaml compiler is
-installed, standalone source sets retain conservative local/module and
-function-value resolution. Functions nested in functor bodies are included.
+For Dune projects, DiffKit runs `dune build @check`, reads generated `.cmt`
+files through `compiler-libs.common`, and combines resolved `Path.t` identities
+with source labels. The adapter is compiled against the active OCaml compiler
+to match its Typedtree version. Standalone compilable `.ml` files use a
+temporary `.cmt`; source-level module and function-value analysis remains
+available when an OCaml compiler is not installed.
 
-## How project analysis works
+`--types` displays inferred curried argument types. Functions declared inside
+functor bodies participate in the same call graph.
 
-Rust project flow:
+## Comparison model
 
-```text
-Git/file snapshot
-  → Cargo workspace/feature/target selection
-  → DiffKit as RUSTC_WORKSPACE_WRAPPER
-  → rustc_public typed MIR + monomorphized instances/vtables
-  → source-shaped labels and spans
-  → semantic call forest
-```
+Project analysis produces a forest rather than assuming a single entry point.
+Compiler-provided roots are used when available, and inferred roots cover the
+remaining connected components. Changed detached components therefore appear
+as their own trees, while a changed shared subtree can appear below every root
+that reaches it.
 
-OCaml project flow:
+Both complete semantic graphs are compared before presentation depth is
+applied. Unchanged roots disappear from the report, stable branches collapse to
+one line of context, and a deeper change beyond `--max-depth` appears as:
 
 ```text
-Git/file snapshot
-  → Dune @check
-  → .cmt Typedtree through compiler-libs
-  → resolved paths + function-value flow
-  → source-shaped labels and spans
-  → semantic call forest
+… changed below max depth
 ```
 
-DiffKit builds every backend-declared or inferred graph-root tree. Functions
-not connected to a main/library entry form additional detached trees, so their
-changes are not lost. A shared changed subtree is repeated under each real root
-that reaches it. Call graphs are may-call structure; runtime branch feasibility
-is not part of the model. Both complete semantic graphs are compared; roots
-with no change are removed from the report, and unchanged descendants are
-collapsed to one line of context around changed paths. `--max-depth` is applied
-only after that comparison, so a deeper change is retained as
-`… changed below max depth` instead of being reported as no change.
+`diffkit file FILE` uses the surrounding project for semantic resolution and
+sets the selected file as the expansion boundary. Comparing two files matches
+roots by semantic identity and renders unmatched roots as added or removed
+trees.
 
-Rust semantic results are cached per before/after endpoint under
-`target/diffkit-semantic`. The cache key includes project inputs, relevant
-compiler environment, rustc/Cargo identity, and the DiffKit analyzer identity.
-An unchanged endpoint skips Cargo and `rustc_public` entirely; when only the
-worktree changes, the revision endpoint remains a cache hit. Use `--verbose`
-to inspect hit/miss and timing information. Revision snapshots are materialized
-with one Git archive operation, and worktree snapshot fingerprints hash only
-Git-reported changed/untracked inputs instead of rescanning generated trees.
+## Performance
 
-## Source layout
+Rust semantic endpoints are cached under `target/diffkit-semantic`. Cache keys
+cover project inputs, compiler settings, Cargo and rustc identities, and the
+DiffKit analyzer version. An unchanged endpoint can reuse its call graph
+without another compiler run.
+
+Git revisions are materialized with one archive operation. Worktree cache keys
+hash Git-reported changed and untracked inputs, keeping cache checks proportional
+to the active change set. Use `--verbose` to inspect hit/miss and timing data.
+
+## Architecture
 
 ```text
 src/
   language/
-    mod.rs       backend registry + file/project contracts
-    rust.rs      syn labels + Cargo/rustc_public semantics
-    ocaml.rs     OCaml labels + compiler-libs/function-value semantics
-  model.rs       language-neutral semantic call graph, edge identity, evidence
+    mod.rs       backend registry and file/project contracts
+    rust.rs      syn labels and Cargo/rustc_public semantics
+    ocaml.rs     OCaml labels and compiler-libs/function-value semantics
+  model.rs       semantic call graph, call-site identity, dispatch evidence
   graph.rs       root inference and cycle-safe forest expansion
-  diff.rs        semantic-key tree alignment
-  render.rs      tree/diff/color rendering; no language syntax branches
-  engine.rs      file/project orchestration
+  diff.rs        semantic tree alignment
+  render.rs      tree, diff, and color rendering
+  engine.rs      file and project orchestration
   git.rs         Git endpoints and isolated snapshots
   lib.rs
-  main.rs        clap CLI and rustc-wrapper entry
+  main.rs        clap CLI and rustc wrapper entry
 support/
   ocaml/extract.ml
 ```
 
-Adding TypeScript or Zig means adding `language/typescript.rs` or
-`language/zig.rs` that uses that compiler's own semantic representation and
-emits the same small call-graph result. It does not mean introducing a shared
-compiler AST/IR.
+A new language backend owns its parser or compiler representation and emits the
+shared `SemanticCallGraph`. TypeScript and Zig support can therefore live in
+`language/typescript.rs` and `language/zig.rs` while reusing graph comparison,
+root handling, and rendering.
 
-## Building
+## Development
 
-The pinned nightly installs `rustc-dev`, LLVM tools, rustfmt, and clippy.
-`.cargo/config.toml` uses dynamic compiler libraries, and `build.rs` embeds the
-active sysroot library path so the resulting binary can run outside
-`cargo run`.
+The repository pins the required nightly toolchain and components through
+`rust-toolchain.toml`.
 
 ```sh
 cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```

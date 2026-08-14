@@ -16,7 +16,18 @@ result combines compiler-accurate targets, explicit dynamic-dispatch
 completeness, source-shaped output, and fast repeat runs through Git-aware
 semantic caches.
 
-![DiffKit colored terminal output](https://raw.githubusercontent.com/Pribess/DiffKit/main/docs/terminal.svg)
+```diff
+  checkout(total)
+  ├─ validate(total)
+- ├─ LegacyGateway::charge(total)
++ ├─ run<Postgres>(&Postgres, total)
++ │  └─ Postgres::save(total)
++ │     └─ sql::commit()
+  ├─ dyn Notifier::send(receipt) [partial]
++ │  ╠═ Email::send(receipt)
+  │  ╚═ … unresolved targets
+  └─ finalize()
+```
 
 ## Installation
 

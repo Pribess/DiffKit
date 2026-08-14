@@ -8,31 +8,20 @@ Rust and OCaml are supported today. Each language backend uses its compiler's
 semantic representation and emits a compact call graph for the shared diff and
 renderer.
 
+Under the hood, DiffKit resolves Rust calls from Cargo-selected
+`rustc_public` MIR and OCaml calls from Dune `.cmt` Typedtrees, propagates
+generics, trait-object provenance, and function values per caller context, then
+aligns complete call forests by semantic symbol and call-site identity. The
+result combines compiler-accurate targets, explicit dynamic-dispatch
+completeness, source-shaped output, and fast repeat runs through Git-aware
+semantic caches.
+
 ```text
   checkout(total)
   ├─ validate(total)
   └─ charge<Postgres>(total)
 +    └─ audit(total)
 ```
-
-## Why DiffKit
-
-The unit of comparison is a resolved call edge: a specific caller, call site,
-callee, and dispatch relationship. That makes the report useful for reviewing
-behavioral impact rather than reconstructing it from edited lines.
-
-| Capability | Implementation | Review value |
-| --- | --- | --- |
-| Compiler-native resolution | Rust MIR through `rustc_public`; OCaml Typedtree and `Path.t` through `compiler-libs` | Calls follow the identities and types accepted by the compiler |
-| Context-sensitive specialization | Generic arguments, trait-object provenance, and function values propagate along call edges | Different callers retain different concrete call trees |
-| Explainable dynamic dispatch | Every candidate set carries completeness, evidence, and unresolved causes | The output distinguishes a proven set from a partial or unresolved set |
-| Source-shaped output | Compiler identities map back to source arguments, closures, modules, and spans | Trees stay compact and recognizable during review |
-| Whole-project impact | Complete call forests are compared before unchanged branches are collapsed | Deep changes appear below affected roots and inside detached components |
-| Incremental analysis | Git-aware endpoint fingerprints and semantic graph caches | Repeated reviews reuse unchanged compiler results |
-
-This combination is especially valuable for generic and higher-order code. A
-single source definition can produce several caller-specific trees, while a
-single edited leaf can surface under every entry path that reaches it.
 
 ## Installation
 
@@ -270,82 +259,6 @@ available when an OCaml compiler is not installed.
 
 `--types` displays inferred curried argument types. Functions declared inside
 functor bodies participate in the same call graph.
-
-## How it works
-
-```text
-Git revisions / worktree / files
-  → isolated source snapshots
-  → language-native semantic extraction
-      Rust: Cargo targets → rustc_public typed MIR
-      OCaml: Dune → .cmt → compiler-libs Typedtree
-  → SemanticCallGraph
-  → caller-context propagation and specialization
-  → cycle-safe call forest
-  → weighted semantic alignment
-  → changed-path collapse and tree rendering
-```
-
-### 1. Capture the real project context
-
-Git comparisons materialize isolated before and after trees. Cargo selects the
-workspace packages, features, and targets used for Rust analysis. Dune produces
-the `.cmt` artifacts used for OCaml analysis. File commands still discover the
-surrounding project, so a selected source file keeps access to its type and
-module context.
-
-### 2. Combine compiler identity with source presentation
-
-The source pass records declaration labels, argument expressions, closures,
-and exact call-site spans. The compiler pass supplies authoritative definition
-identities, inferred types, concrete generic instances, and dispatch data. The
-merge keeps compiler precision while presenting calls in the syntax developers
-wrote.
-
-### 3. Normalize a small semantic graph
-
-Language backends emit the same compact `SemanticCallGraph`. Definitions and
-call sites have separate identities, and each edge is classified as:
-
-- a direct call to one semantic symbol;
-- a typed indirect call such as a function pointer; or
-- a dynamic call with candidate targets, completeness, evidence, and
-  unresolved causes.
-
-Language-specific AST, MIR, and Typedtree objects remain inside their backends.
-The graph, diff, and renderer operate only on semantic symbols, calls, source
-spans, and language-shaped labels.
-
-### 4. Specialize by incoming context
-
-Rust generic parameters and trait-object flows are propagated through direct
-calls, returns, aliases, branches, and typed memory regions. Context propagation
-runs across all analyzed workspace crates, allowing an application root to
-specialize a generic body from a library crate. Dynamic receivers are resolved
-from values that reach that call site rather than from a project-wide candidate
-pool.
-
-OCaml function values use the same principle: callable arguments are propagated
-from connected callers, then local functions and module paths are resolved in
-that caller context.
-
-### 5. Build every relevant tree
-
-Backend-declared and inferred roots seed forest expansion. Remaining connected
-components receive deterministic roots, which keeps detached library or test
-changes visible. An ancestor stack converts recursion into a back-edge at the
-first repeated active node.
-
-### 6. Align semantic changes
-
-Root nodes align by semantic symbol identity. Repeated child calls use weighted
-sequence alignment over call-site identity, source label, edge relation, and
-shallow subtree shape. This preserves the identity of existing calls when a
-new invocation of the same callee is inserted nearby.
-
-DiffKit compares the complete trees first. Presentation rules then collapse
-unchanged branches and apply `--max-depth`, preserving a marker whenever a
-changed path continues below the display boundary.
 
 ## Comparison model
 

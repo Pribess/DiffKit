@@ -2,12 +2,15 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use sha2::{Digest, Sha256};
 
 use crate::DiffkitResult;
 
 static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const SNAPSHOT_FINGERPRINT_FILE: &str = ".diffkit-snapshot-key";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitEndpoint {
@@ -72,9 +75,15 @@ impl GitComparison {
 
     pub fn materialize(&self) -> DiffkitResult<(GitSnapshot, GitSnapshot)> {
         let before = GitSnapshot::create(&self.root, &self.before)?;
-        let after = GitSnapshot::create(&self.root, &self.after)?;
+        let mut after = GitSnapshot::create(&self.root, &self.after)?;
         if self.restricted {
             restrict_snapshot(before.path(), after.path(), &self.changed_paths)?;
+            after.fingerprint = restricted_snapshot_fingerprint(
+                &before.fingerprint,
+                after.path(),
+                &self.changed_paths,
+            )?;
+            after.write_fingerprint()?;
         }
         Ok((before, after))
     }
@@ -117,6 +126,7 @@ fn restrict_snapshot(before: &Path, after: &Path, selected_paths: &[PathBuf]) ->
 pub struct GitSnapshot {
     directory: PathBuf,
     label: String,
+    fingerprint: String,
 }
 
 impl GitSnapshot {
@@ -130,11 +140,13 @@ impl GitSnapshot {
         let snapshot = Self {
             directory,
             label: endpoint.label().to_owned(),
+            fingerprint: endpoint_fingerprint(root, endpoint)?,
         };
         match endpoint {
             GitEndpoint::Revision(revision) => snapshot.copy_revision(root, revision)?,
             GitEndpoint::Worktree => copy_worktree(root, snapshot.path())?,
         }
+        snapshot.write_fingerprint()?;
         Ok(snapshot)
     }
 
@@ -147,22 +159,148 @@ impl GitSnapshot {
     }
 
     fn copy_revision(&self, root: &Path, revision: &str) -> DiffkitResult<()> {
-        let listing = git_output(root, ["ls-tree", "-r", "-z", "--name-only", revision])?;
-        for raw_path in listing
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-        {
-            let relative = bytes_to_path(raw_path)?;
-            let spec = format!("{revision}:{}", relative.to_string_lossy());
-            let contents = git_output_bytes(root, [OsStr::new("show"), OsStr::new(&spec)])?;
-            let destination = self.directory.join(&relative);
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(destination, contents)?;
+        let mut archive = Command::new("git")
+            .args(["archive", "--format=tar", revision])
+            .current_dir(root)
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let archive_output = archive
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("git archive stdout was not captured"))?;
+        let extract = Command::new("tar")
+            .args(["-xf", "-", "-C"])
+            .arg(&self.directory)
+            .stdin(Stdio::from(archive_output))
+            .output()?;
+        let archive_status = archive.wait()?;
+        if !archive_status.success() {
+            return Err(
+                std::io::Error::other(format!("git archive exited with {archive_status}")).into(),
+            );
+        }
+        if !extract.status.success() {
+            let diagnostic = String::from_utf8_lossy(&extract.stderr).trim().to_owned();
+            return Err(std::io::Error::other(if diagnostic.is_empty() {
+                format!("tar extraction exited with {}", extract.status)
+            } else {
+                diagnostic
+            })
+            .into());
         }
         Ok(())
     }
+
+    fn write_fingerprint(&self) -> std::io::Result<()> {
+        fs::write(
+            self.directory.join(SNAPSHOT_FINGERPRINT_FILE),
+            &self.fingerprint,
+        )
+    }
+}
+
+fn endpoint_fingerprint(root: &Path, endpoint: &GitEndpoint) -> DiffkitResult<String> {
+    match endpoint {
+        GitEndpoint::Revision(revision) => {
+            let tree = git_output(root, ["rev-parse", &format!("{revision}^{{tree}}")])?;
+            Ok(format!("tree:{}", String::from_utf8_lossy(&tree).trim()))
+        }
+        GitEndpoint::Worktree => {
+            let mut hasher = Sha256::new();
+            let head = git_output(root, ["rev-parse", "HEAD^{tree}"])?;
+            hasher.update(&head);
+            let changed = git_output_bytes(
+                root,
+                [
+                    OsStr::new("diff"),
+                    OsStr::new("--name-only"),
+                    OsStr::new("-z"),
+                    OsStr::new("HEAD"),
+                ],
+            )?;
+            let untracked = git_output_bytes(
+                root,
+                [
+                    OsStr::new("ls-files"),
+                    OsStr::new("--others"),
+                    OsStr::new("--exclude-standard"),
+                    OsStr::new("-z"),
+                ],
+            )?;
+            let mut paths = changed
+                .split(|byte| *byte == 0)
+                .chain(untracked.split(|byte| *byte == 0))
+                .filter(|path| !path.is_empty())
+                .map(bytes_to_path)
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            for path in std::mem::take(&mut paths) {
+                if should_skip(&path) {
+                    continue;
+                }
+                hash_path_state(&mut hasher, root, &path)?;
+            }
+            Ok(format!("worktree:{:x}", hasher.finalize()))
+        }
+    }
+}
+
+fn restricted_snapshot_fingerprint(
+    before_fingerprint: &str,
+    after_root: &Path,
+    selected_paths: &[PathBuf],
+) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"restricted\0");
+    hasher.update(before_fingerprint.as_bytes());
+    for path in selected_paths.iter().collect::<BTreeSet<_>>() {
+        hash_path_state(&mut hasher, after_root, path)?;
+    }
+    Ok(format!("restricted:{:x}", hasher.finalize()))
+}
+
+fn hash_path_state(hasher: &mut Sha256, root: &Path, relative: &Path) -> std::io::Result<()> {
+    let raw_path = relative.as_os_str().as_encoded_bytes();
+    hasher.update((raw_path.len() as u64).to_le_bytes());
+    hasher.update(raw_path);
+
+    let absolute = root.join(relative);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update(b"missing");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    hash_file_mode(hasher, &metadata);
+    if metadata.file_type().is_symlink() {
+        hasher.update(b"symlink");
+        let target = fs::read_link(absolute)?;
+        let raw_target = target.as_os_str().as_encoded_bytes();
+        hasher.update((raw_target.len() as u64).to_le_bytes());
+        hasher.update(raw_target);
+    } else if metadata.is_file() {
+        hasher.update(b"file");
+        let contents = fs::read(absolute)?;
+        hasher.update((contents.len() as u64).to_le_bytes());
+        hasher.update(contents);
+    } else if metadata.is_dir() {
+        hasher.update(b"directory");
+    } else {
+        hasher.update(b"other");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hash_file_mode(hasher: &mut Sha256, metadata: &fs::Metadata) {
+    use std::os::unix::fs::PermissionsExt;
+    hasher.update(metadata.permissions().mode().to_le_bytes());
+}
+
+#[cfg(not(unix))]
+fn hash_file_mode(hasher: &mut Sha256, metadata: &fs::Metadata) {
+    hasher.update([u8::from(metadata.permissions().readonly())]);
 }
 
 impl Drop for GitSnapshot {
@@ -250,6 +388,45 @@ fn changed_paths(
 }
 
 fn copy_worktree(source: &Path, destination: &Path) -> DiffkitResult<()> {
+    if source.join(".git").exists() {
+        let listing = git_output_bytes(
+            source,
+            [
+                OsStr::new("ls-files"),
+                OsStr::new("--cached"),
+                OsStr::new("--others"),
+                OsStr::new("--exclude-standard"),
+                OsStr::new("-z"),
+            ],
+        )?;
+        for raw_path in listing
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let relative = bytes_to_path(raw_path)?;
+            if should_skip(&relative) {
+                continue;
+            }
+            let path = source.join(&relative);
+            if !path.exists() {
+                continue;
+            }
+            let target = destination.join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                let resolved = fs::canonicalize(&path)?;
+                if resolved.starts_with(source) && resolved.is_file() {
+                    fs::copy(resolved, target)?;
+                }
+            } else if metadata.is_file() {
+                fs::copy(path, target)?;
+            }
+        }
+        return Ok(());
+    }
     copy_directory(source, destination, source)
 }
 
@@ -353,5 +530,31 @@ mod tests {
         assert!(should_skip(Path::new("target/debug/app")));
         assert!(should_skip(Path::new("web/node_modules/pkg")));
         assert!(!should_skip(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn restricted_fingerprints_include_the_selected_path_and_state() {
+        let sequence = SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "diffkit-fingerprint-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.rs"), "fn same() {}\n").unwrap();
+        fs::write(root.join("b.rs"), "fn same() {}\n").unwrap();
+
+        let a = restricted_snapshot_fingerprint("tree:before", &root, &[PathBuf::from("a.rs")])
+            .unwrap();
+        let b = restricted_snapshot_fingerprint("tree:before", &root, &[PathBuf::from("b.rs")])
+            .unwrap();
+        assert_ne!(a, b);
+
+        fs::write(root.join("a.rs"), "fn changed() {}\n").unwrap();
+        let changed =
+            restricted_snapshot_fingerprint("tree:before", &root, &[PathBuf::from("a.rs")])
+                .unwrap();
+        assert_ne!(a, changed);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tree_sitter::{Node, Parser};
 
-use super::{FileContext, FrontendResult, LanguageFrontend};
+use super::{FileContext, FrontendResult, LanguageBackend, ProjectContext};
 use crate::model::{
-    CallLabel, CallSite, CallSyntax, CallTarget, DispatchCandidate, DispatchResolution,
-    FileAnalysis, FunctionInfo, LanguageFact, LanguageId, SourceSpan, SymbolId,
+    CallLabel, CallSite, CallSiteId, CallSyntax, CallTarget, DispatchCandidate, DispatchEvidence,
+    DispatchResolution, FileAnalysis, FunctionInfo, LanguageFact, LanguageId, SourceSpan, SymbolId,
+    UnresolvedReason,
 };
 
 static OCAML_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -21,6 +22,8 @@ const OCAML_EXTRACTOR_SOURCE: &str = include_str!("../../support/ocaml/extract.m
 /// conservative module/local resolution and the same graph contract.
 #[derive(Default)]
 pub struct OcamlFrontend;
+
+pub static OCAML_BACKEND: OcamlFrontend = OcamlFrontend;
 
 /// Analyze a Dune project from compiler-generated `.cmt` Typedtrees. Source
 /// parsing remains responsible for language-shaped labels; resolved `Path.t`
@@ -86,6 +89,9 @@ pub fn analyze_semantic_project(root: &Path) -> FrontendResult<FileAnalysis> {
         apply_typed_events(&mut file_analysis, &events);
         analysis.functions.append(&mut file_analysis.functions);
         analysis.facts.append(&mut file_analysis.facts);
+        analysis
+            .source_files
+            .append(&mut file_analysis.source_files);
     }
     resolve_ocaml_function_values(&mut analysis);
     Ok(analysis)
@@ -109,8 +115,14 @@ pub fn analyze_source_project(root: &Path) -> FrontendResult<FileAnalysis> {
             },
             &source,
         )?;
+        if let Some(events) = standalone_typed_events(&file, &source)? {
+            apply_typed_events(&mut file_analysis, &events);
+        }
         analysis.functions.append(&mut file_analysis.functions);
         analysis.facts.append(&mut file_analysis.facts);
+        analysis
+            .source_files
+            .append(&mut file_analysis.source_files);
     }
     resolve_ocaml_function_values(&mut analysis);
     Ok(analysis)
@@ -167,10 +179,11 @@ impl Drop for OcamlExtractor {
 #[derive(Clone, Debug)]
 struct TypedCallEvent {
     target: Option<String>,
+    signature: Option<String>,
     span: SourceSpan,
 }
 
-impl LanguageFrontend for OcamlFrontend {
+impl LanguageBackend for OcamlFrontend {
     fn language(&self) -> LanguageId {
         LanguageId::new("ocaml")
     }
@@ -185,8 +198,80 @@ impl LanguageFrontend for OcamlFrontend {
         source: &str,
     ) -> FrontendResult<FileAnalysis> {
         let mut analysis = analyze_ocaml_syntax(context, source)?;
+        if let Some(events) = standalone_typed_events(context.path, source)? {
+            apply_typed_events(&mut analysis, &events);
+        }
         resolve_ocaml_function_values(&mut analysis);
         Ok(analysis)
+    }
+
+    fn analyze_project(&self, context: &ProjectContext<'_>) -> FrontendResult<FileAnalysis> {
+        if context.root.join("dune-project").is_file() {
+            analyze_semantic_project(context.root)
+        } else {
+            analyze_source_project(context.root)
+        }
+    }
+}
+
+fn standalone_typed_events(
+    source_path: &Path,
+    source: &str,
+) -> FrontendResult<Option<Vec<TypedCallEvent>>> {
+    if Command::new("ocamlc").arg("-version").output().is_err() {
+        return Ok(None);
+    }
+    let sequence = OCAML_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "diffkit-ocaml-source-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory)?;
+    let capture = StandaloneOcamlCapture { directory };
+    let extension = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("ml");
+    let temporary_source = capture.directory.join(format!("input.{extension}"));
+    fs::write(&temporary_source, source)?;
+    let compile = Command::new("ocamlc")
+        .args(["-bin-annot", "-c"])
+        .arg(&temporary_source)
+        .current_dir(&capture.directory)
+        .output()?;
+    if !compile.status.success() {
+        // A standalone snippet may intentionally depend on surrounding
+        // modules. Keep the conservative graph, with unresolved calls marked
+        // explicitly, instead of pretending the compiler accepted it.
+        return Ok(None);
+    }
+    let annotation = if extension == "mli" {
+        capture.directory.join("input.cmti")
+    } else {
+        capture.directory.join("input.cmt")
+    };
+    if !annotation.is_file() {
+        return Ok(None);
+    }
+    let helper = OcamlExtractor::compile()?;
+    let output = Command::new(helper.executable()).arg(annotation).output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let mut events = parse_typed_events(&capture.directory, &String::from_utf8(output.stdout)?)?;
+    for event in &mut events {
+        event.span.file = source_path.to_path_buf();
+    }
+    Ok(Some(events))
+}
+
+struct StandaloneOcamlCapture {
+    directory: PathBuf,
+}
+
+impl Drop for StandaloneOcamlCapture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -212,6 +297,7 @@ fn analyze_ocaml_syntax(context: &FileContext<'_>, source: &str) -> FrontendResu
     }
 
     let mut analysis = FileAnalysis::default();
+    analysis.source_files.insert(context.path.to_path_buf());
     let module = context
         .module
         .iter()
@@ -292,7 +378,7 @@ fn parse_typed_events(root: &Path, output: &str) -> FrontendResult<Vec<TypedCall
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let fields = line.split('\t').collect::<Vec<_>>();
-            if fields.len() != 7 {
+            if fields.len() != 8 {
                 return Err(
                     io::Error::other(format!("invalid compiler-libs event: {line}")).into(),
                 );
@@ -306,6 +392,7 @@ fn parse_typed_events(root: &Path, output: &str) -> FrontendResult<Vec<TypedCall
             let file = dune_source_path(root, &file).unwrap_or(file);
             Ok(TypedCallEvent {
                 target: (fields[0] == "direct").then(|| fields[1].to_owned()),
+                signature: (!fields[7].is_empty()).then(|| fields[7].to_owned()),
                 span: SourceSpan {
                     file,
                     start_line: fields[3].parse()?,
@@ -344,6 +431,7 @@ fn dune_source_path(root: &Path, file: &Path) -> Option<PathBuf> {
 }
 
 fn apply_typed_events(analysis: &mut FileAnalysis, events: &[TypedCallEvent]) {
+    let parameters = ocaml_parameters(&analysis.functions, &analysis.facts);
     for function in &mut analysis.functions {
         for call in &mut function.calls {
             if matches!(
@@ -365,24 +453,79 @@ fn apply_typed_events(analysis: &mut FileAnalysis, events: &[TypedCallEvent]) {
             else {
                 continue;
             };
+            if let Some(signature) = &event.signature {
+                call.label.typed = Some(annotate_ocaml_call(&call.label.default, call, signature));
+            }
+            let is_callable_parameter = match &call.syntax {
+                CallSyntax::Path(parts) if parts.len() == 1 => parameters
+                    .get(&function.id)
+                    .is_some_and(|names| names.contains(&parts[0])),
+                _ => false,
+            };
             call.target = match &event.target {
                 Some(target) => CallTarget::Direct(ocaml_path_symbol(target)),
-                None => CallTarget::Dynamic {
-                    dispatch: SymbolId {
-                        language: LanguageId::new("ocaml"),
-                        module: function.id.module.clone(),
-                        container: Some(function.id.name.clone()),
-                        name: format!(
-                            "indirect@{}:{}",
-                            call.span.start_line, call.span.start_column
-                        ),
-                    },
-                    candidates: Vec::new(),
-                    resolution: DispatchResolution::Unresolved,
+                None if is_callable_parameter => CallTarget::Unresolved,
+                None => CallTarget::Indirect {
+                    signature: event.signature.clone(),
+                    reason: UnresolvedReason::OpaqueInput,
                 },
             };
         }
     }
+}
+
+fn annotate_ocaml_call(label: &str, call: &CallSite, signature: &str) -> String {
+    let arguments = ocaml_call_arguments(call);
+    if arguments.is_empty() {
+        return label.to_owned();
+    }
+    let mut types = split_ocaml_function_type(signature);
+    if types.len() <= 1 {
+        return label.to_owned();
+    }
+    types.pop(); // Return type is intentionally not rendered.
+    if types.len() < arguments.len() {
+        return label.to_owned();
+    }
+    let callee = match &call.syntax {
+        CallSyntax::Path(parts) => parts.join("."),
+        CallSyntax::SelfMethod(method) => method.clone(),
+        CallSyntax::Method { receiver, method } => format!("{receiver}#{method}"),
+    };
+    let types = &types[types.len() - arguments.len()..];
+    let annotated = arguments
+        .iter()
+        .zip(types)
+        .map(|(argument, ty)| {
+            let ty = ty.split_once(':').map_or(ty.as_str(), |(_, ty)| ty).trim();
+            format!("({argument}: {ty})")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{callee} {annotated}")
+}
+
+fn split_ocaml_function_type(signature: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let bytes = signature.as_bytes();
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'-' if bytes[index + 1] == b'>' && depth == 0 => {
+                result.push(signature[start..index].trim().to_owned());
+                start = index + 2;
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    result.push(signature[start..].trim().to_owned());
+    result
 }
 
 fn ocaml_path_symbol(path: &str) -> SymbolId {
@@ -465,14 +608,31 @@ fn analyze_module_definition(
         let Some(body) = binding.child_by_field_name("body") else {
             continue;
         };
-        if body.kind() != "structure" {
+        let body = if body.kind() == "structure" {
+            body
+        } else if let Some(structure) = first_descendant_of_kind(body, "structure") {
+            structure
+        } else {
             continue;
-        }
+        };
 
         let mut nested_module = module.to_vec();
         nested_module.push(node_text(name_node, source).to_owned());
         analyze_structure(file, &nested_module, body, source, analysis);
     }
+}
+
+fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind {
+            return Some(child);
+        }
+        if let Some(found) = first_descendant_of_kind(child, kind) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn analyze_value_definition(
@@ -632,7 +792,7 @@ fn local_callable_source_name(function: &FunctionInfo) -> &str {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CallableFlow {
     candidates: BTreeSet<SymbolId>,
-    opaque: bool,
+    unresolved_reasons: BTreeSet<UnresolvedReason>,
 }
 
 #[derive(Clone, Debug)]
@@ -794,7 +954,9 @@ fn specialize_ocaml_function_values(
                             .cloned()
                             .unwrap_or_else(|| CallableFlow {
                                 candidates: BTreeSet::new(),
-                                opaque: true,
+                                unresolved_reasons: [UnresolvedReason::AnalysisLimit]
+                                    .into_iter()
+                                    .collect(),
                             });
                     let arguments = ocaml_call_arguments(call);
                     let candidates = flow
@@ -827,11 +989,12 @@ fn specialize_ocaml_function_values(
                             })
                         })
                         .collect::<Vec<_>>();
-                    let resolution = match (candidates.is_empty(), flow.opaque) {
-                        (true, _) => DispatchResolution::Unresolved,
-                        (false, true) => DispatchResolution::Partial,
-                        (false, false) => DispatchResolution::Complete,
-                    };
+                    let resolution =
+                        match (candidates.is_empty(), !flow.unresolved_reasons.is_empty()) {
+                            (true, _) => DispatchResolution::Unresolved,
+                            (false, true) => DispatchResolution::Partial,
+                            (false, false) => DispatchResolution::Complete,
+                        };
                     call.target = CallTarget::Dynamic {
                         dispatch: SymbolId {
                             language: LanguageId::new("ocaml"),
@@ -841,6 +1004,8 @@ fn specialize_ocaml_function_values(
                         },
                         candidates,
                         resolution,
+                        evidence: DispatchEvidence::ExactFlow,
+                        unresolved_reasons: flow.unresolved_reasons,
                     };
                     continue;
                 }
@@ -904,7 +1069,11 @@ fn root_ocaml_context(
         .enumerate()
         .map(|(index, _)| CallableFlow {
             candidates: BTreeSet::new(),
-            opaque: called_parameters.contains(&(function.id.clone(), index)),
+            unresolved_reasons: called_parameters
+                .contains(&(function.id.clone(), index))
+                .then_some(UnresolvedReason::OpaqueInput)
+                .into_iter()
+                .collect(),
         })
         .collect()
 }
@@ -931,7 +1100,7 @@ fn ocaml_call_context(
             arguments.get(index).map_or_else(
                 || CallableFlow {
                     candidates: BTreeSet::new(),
-                    opaque: true,
+                    unresolved_reasons: [UnresolvedReason::AnalysisLimit].into_iter().collect(),
                 },
                 |argument| {
                     argument_callable_flow(argument, caller, caller_context, functions, parameters)
@@ -956,8 +1125,8 @@ fn specialized_ocaml_id(
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
-            if flow.opaque {
-                values.push("?".to_owned());
+            for reason in &flow.unresolved_reasons {
+                values.push(format!("?{reason}"));
             }
             format!("{index}={}", values.join("|"))
         })
@@ -1062,7 +1231,9 @@ fn argument_callable_flow(
     parse_ocaml_callable_flow(argument, caller, caller_context, functions, parameters)
         .unwrap_or_else(|| CallableFlow {
             candidates: BTreeSet::new(),
-            opaque: true,
+            unresolved_reasons: [UnresolvedReason::UnsupportedConstruct]
+                .into_iter()
+                .collect(),
         })
 }
 
@@ -1236,7 +1407,8 @@ fn ocaml_callable_node_flow(
             .filter(|child| matches!(child.kind(), "then_clause" | "else_clause"))
         {
             let Some(expression) = clause.child_by_field_name("expression") else {
-                flow.opaque = true;
+                flow.unresolved_reasons
+                    .insert(UnresolvedReason::UnsupportedConstruct);
                 continue;
             };
             branches += 1;
@@ -1253,7 +1425,10 @@ fn ocaml_callable_node_flow(
                 .unwrap_or_else(opaque_callable_flow),
             );
         }
-        flow.opaque |= branches < 2;
+        if branches < 2 {
+            flow.unresolved_reasons
+                .insert(UnresolvedReason::OpaqueInput);
+        }
         return Some(flow);
     }
     if matches!(node.kind(), "match_expression" | "function_expression") {
@@ -1265,7 +1440,8 @@ fn ocaml_callable_node_flow(
             .filter(|child| child.kind() == "match_case")
         {
             let Some(body) = case.child_by_field_name("body") else {
-                flow.opaque = true;
+                flow.unresolved_reasons
+                    .insert(UnresolvedReason::UnsupportedConstruct);
                 continue;
             };
             branches += 1;
@@ -1298,7 +1474,7 @@ fn ocaml_callable_atom_flow(
     if let Some(target) = argument_callable_symbol(argument, &caller.id, functions) {
         return Some(CallableFlow {
             candidates: BTreeSet::from([target]),
-            opaque: false,
+            unresolved_reasons: BTreeSet::new(),
         });
     }
     parameters
@@ -1319,13 +1495,15 @@ fn ocaml_callable_atom_flow(
 fn opaque_callable_flow() -> CallableFlow {
     CallableFlow {
         candidates: BTreeSet::new(),
-        opaque: true,
+        unresolved_reasons: [UnresolvedReason::OpaqueInput].into_iter().collect(),
     }
 }
 
 fn merge_callable_flow(destination: &mut CallableFlow, source: CallableFlow) {
     destination.candidates.extend(source.candidates);
-    destination.opaque |= source.opaque;
+    destination
+        .unresolved_reasons
+        .extend(source.unresolved_reasons);
 }
 
 fn argument_callable_symbol(
@@ -1537,15 +1715,21 @@ fn collect_calls(
     if node.kind() == "application_expression" {
         if let Some(function) = node.child_by_field_name("function") {
             if let Some(parts) = ocaml_value_path(function, source) {
+                let syntax = CallSyntax::Path(parts);
+                let span = tree_sitter_span(file, node);
                 calls.push(CallSite {
-                    syntax: CallSyntax::Path(parts),
+                    id: CallSiteId::source(&syntax, &span),
+                    syntax,
                     target: CallTarget::Unresolved,
                     label: CallLabel::new(normalize_source(node_text(node, source))),
-                    span: tree_sitter_span(file, node),
+                    span,
                 });
             } else if function.kind() == "method_invocation" {
+                let syntax = CallSyntax::Path(vec![normalize_source(node_text(function, source))]);
+                let span = tree_sitter_span(file, node);
                 calls.push(CallSite {
-                    syntax: CallSyntax::Path(vec![normalize_source(node_text(function, source))]),
+                    id: CallSiteId::source(&syntax, &span),
+                    syntax,
                     target: CallTarget::Dynamic {
                         dispatch: SymbolId {
                             language: LanguageId::new("ocaml"),
@@ -1559,9 +1743,11 @@ fn collect_calls(
                         },
                         candidates: Vec::new(),
                         resolution: DispatchResolution::Unresolved,
+                        evidence: DispatchEvidence::ExactFlow,
+                        unresolved_reasons: [UnresolvedReason::OpaqueInput].into_iter().collect(),
                     },
                     label: CallLabel::new(normalize_source(node_text(node, source))),
-                    span: tree_sitter_span(file, node),
+                    span,
                 });
             }
         }
@@ -1896,5 +2082,37 @@ mod tests {
         }
         let extractor = OcamlExtractor::compile().unwrap();
         assert!(extractor.executable().is_file());
+    }
+
+    #[test]
+    fn splits_curried_inferred_types_without_splitting_nested_arrows() {
+        assert_eq!(
+            split_ocaml_function_type("('a -> 'b) -> label:int -> 'a -> 'b"),
+            ["('a -> 'b)", "label:int", "'a", "'b"]
+        );
+    }
+
+    #[test]
+    fn extracts_functions_declared_inside_a_functor_body() {
+        let source = r#"
+            module Make (Store : sig val save : int -> unit end) = struct
+              let run value = Store.save value
+            end
+        "#;
+        let analysis = OcamlFrontend
+            .analyze_file(
+                &FileContext {
+                    path: Path::new("functor.ml"),
+                    module: &[],
+                },
+                source,
+            )
+            .unwrap();
+        assert!(
+            analysis
+                .functions
+                .iter()
+                .any(|function| { function.id.module == ["Make"] && function.id.name == "run" })
+        );
     }
 }

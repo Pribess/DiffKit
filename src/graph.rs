@@ -9,13 +9,18 @@ use crate::model::{
 pub struct ProgramGraph {
     functions: BTreeMap<SymbolId, FunctionInfo>,
     facts: Vec<LanguageFact>,
+    source_files: BTreeSet<std::path::PathBuf>,
+    declared_roots: BTreeSet<SymbolId>,
 }
 
 impl ProgramGraph {
     pub fn from_files(files: impl IntoIterator<Item = FileAnalysis>) -> Result<Self, String> {
         let mut graph = Self::default();
         for file in files {
+            graph.source_files.extend(file.source_files);
+            graph.declared_roots.extend(file.roots);
             for function in file.functions {
+                graph.source_files.insert(function.span.file.clone());
                 if graph.functions.contains_key(&function.id) {
                     return Err(format!("duplicate symbol: {}", function.id));
                 }
@@ -34,11 +39,66 @@ impl ProgramGraph {
         &self.facts
     }
 
+    pub fn resolution_diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = BTreeSet::new();
+        for function in self.functions.values() {
+            for call in &function.calls {
+                match &call.target {
+                    CallTarget::Dynamic {
+                        resolution,
+                        evidence,
+                        unresolved_reasons,
+                        ..
+                    } => {
+                        let reasons = unresolved_reasons
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        diagnostics.insert(format!(
+                            "{}:{}:{}: {}: {:?}, evidence={evidence}{}",
+                            call.span.file.display(),
+                            call.span.start_line,
+                            call.span.start_column,
+                            call.label.default,
+                            resolution,
+                            if reasons.is_empty() {
+                                String::new()
+                            } else {
+                                format!(", unresolved={reasons}")
+                            }
+                        ));
+                    }
+                    CallTarget::Indirect { signature, reason } => {
+                        diagnostics.insert(format!(
+                            "{}:{}:{}: {}: indirect{}, unresolved={reason}",
+                            call.span.file.display(),
+                            call.span.start_line,
+                            call.span.start_column,
+                            call.label.default,
+                            signature
+                                .as_ref()
+                                .map_or_else(String::new, |signature| format!(" ({signature})")),
+                        ));
+                    }
+                    // A direct target outside the analyzed graph is a normal external
+                    // leaf, not incomplete resolution. Keep verbose diagnostics focused
+                    // on call sites whose candidate completeness needs explanation.
+                    CallTarget::Direct(_) | CallTarget::Unresolved => {}
+                }
+            }
+        }
+        diagnostics.into_iter().collect()
+    }
+
     pub fn source_files(&self) -> BTreeSet<std::path::PathBuf> {
-        self.functions
-            .values()
-            .map(|function| function.span.file.clone())
-            .collect()
+        self.source_files.clone()
+    }
+
+    pub fn analyzes_file(&self, file: &std::path::Path) -> bool {
+        self.source_files
+            .iter()
+            .any(|analyzed| same_file(analyzed, file))
     }
 
     pub fn has_functions_in_file(&self, file: &std::path::Path) -> bool {
@@ -60,6 +120,14 @@ impl ProgramGraph {
     /// component has no such function, so its earliest source definition is
     /// used as that component's presentation root.
     pub fn inferred_roots(&self) -> BTreeSet<SymbolId> {
+        if !self.declared_roots.is_empty() {
+            return self
+                .declared_roots
+                .iter()
+                .filter(|root| self.functions.contains_key(*root))
+                .cloned()
+                .collect();
+        }
         let mut incoming = self
             .functions
             .keys()
@@ -214,6 +282,25 @@ impl ProgramGraph {
         }
     }
 
+    /// Resolve only definitions whose bodies belong to `file`. This keeps an
+    /// explicit entry in file mode from silently selecting an equally named
+    /// function in another project file.
+    pub fn resolve_entries_in_file(
+        &self,
+        entry: &str,
+        file: &std::path::Path,
+    ) -> Result<Vec<SymbolId>, String> {
+        let matches = self.resolve_entries(entry)?;
+        Ok(matches
+            .into_iter()
+            .filter(|symbol| {
+                self.functions
+                    .get(symbol)
+                    .is_some_and(|function| same_file(&function.span.file, file))
+            })
+            .collect())
+    }
+
     fn same_contextual_function(&self, symbols: &[SymbolId]) -> bool {
         let Some((first_symbol, remaining)) = symbols.split_first() else {
             return true;
@@ -277,6 +364,7 @@ impl ProgramGraph {
         if depth >= max_depth {
             return CallNode {
                 key: symbol.to_string(),
+                callsite: None,
                 label,
                 relation,
                 children: Vec::new(),
@@ -286,6 +374,7 @@ impl ProgramGraph {
         if !visiting.insert(symbol.clone()) {
             return CallNode {
                 key: symbol.to_string(),
+                callsite: None,
                 label: CallLabel::new(""),
                 relation: CallRelation::BackEdge,
                 children: Vec::new(),
@@ -301,6 +390,7 @@ impl ProgramGraph {
         visiting.remove(symbol);
         CallNode {
             key: symbol.to_string(),
+            callsite: None,
             label,
             relation,
             children,
@@ -321,29 +411,45 @@ impl ProgramGraph {
                 dispatch,
                 candidates,
                 resolution,
-            } => self.expand_dynamic_call(
-                dispatch,
-                &call.label,
-                candidates,
-                *resolution,
-                depth,
-                max_depth,
-                file,
-                visiting,
-            ),
-            CallTarget::Direct(target) => self.expand_direct_call(
-                target.clone(),
-                &call.label,
-                CallRelation::Call,
-                depth,
-                max_depth,
-                file,
-                visiting,
-            ),
+                ..
+            } => {
+                let mut node = self.expand_dynamic_call(
+                    dispatch,
+                    &call.label,
+                    candidates,
+                    *resolution,
+                    depth,
+                    max_depth,
+                    file,
+                    visiting,
+                );
+                node.callsite = Some(call.id.clone());
+                node
+            }
+            CallTarget::Direct(target) => {
+                let mut node = self.expand_direct_call(
+                    target.clone(),
+                    &call.label,
+                    CallRelation::Call,
+                    depth,
+                    max_depth,
+                    file,
+                    visiting,
+                );
+                node.callsite = Some(call.id.clone());
+                node
+            }
+            CallTarget::Indirect { .. } => CallNode {
+                key: format!("{}://indirect/{}", caller.language, call.id.0),
+                callsite: Some(call.id.clone()),
+                label: call.label.with_suffix(" [indirect]"),
+                relation: CallRelation::Call,
+                children: Vec::new(),
+            },
             CallTarget::Unresolved => {
                 let target = self.resolve_call(caller, &call.syntax);
                 if let Some(target) = target {
-                    self.expand_direct_call(
+                    let mut node = self.expand_direct_call(
                         target,
                         &call.label,
                         CallRelation::Call,
@@ -351,10 +457,13 @@ impl ProgramGraph {
                         max_depth,
                         file,
                         visiting,
-                    )
+                    );
+                    node.callsite = Some(call.id.clone());
+                    node
                 } else {
                     CallNode {
                         key: format!("{}://?{}", caller.language, call.syntax.key_fragment()),
+                        callsite: Some(call.id.clone()),
                         label: call.label.clone(),
                         relation: CallRelation::Call,
                         children: Vec::new(),
@@ -392,6 +501,7 @@ impl ProgramGraph {
         } else {
             CallNode {
                 key: target.to_string(),
+                callsite: None,
                 label: label.clone(),
                 relation,
                 children: Vec::new(),
@@ -430,6 +540,7 @@ impl ProgramGraph {
                 .chain(
                     (resolution == DispatchResolution::Partial).then(|| CallNode {
                         key: format!("{dispatch}#unresolved"),
+                        callsite: None,
                         label: CallLabel::new("… unresolved targets"),
                         relation: CallRelation::DispatchCandidate,
                         children: Vec::new(),
@@ -446,6 +557,7 @@ impl ProgramGraph {
 
         CallNode {
             key: dispatch.to_string(),
+            callsite: None,
             label,
             relation: CallRelation::Call,
             children,
@@ -459,6 +571,7 @@ impl ProgramGraph {
                 .iter()
                 .map(|candidate| candidate.target.clone())
                 .collect(),
+            CallTarget::Indirect { .. } => Vec::new(),
             CallTarget::Unresolved => self
                 .resolve_call(caller, &call.syntax)
                 .into_iter()

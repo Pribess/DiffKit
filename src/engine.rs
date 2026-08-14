@@ -1,19 +1,30 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use crate::DiffkitResult;
-use crate::diff::{DiffNode, diff_optional, tree_has_changes};
+use crate::diff::{
+    DiffNode, collapse_unchanged_subtrees, diff_optional, tree_has_changes, truncate_diff_tree,
+};
 use crate::graph::ProgramGraph;
-use crate::language::ocaml::{
-    OcamlFrontend, analyze_semantic_project as analyze_ocaml_project, analyze_source_project,
-};
+use crate::language::ocaml::OcamlFrontend;
 use crate::language::rust::{
-    analyze_semantic_file_with_entries, analyze_semantic_project, analyze_semantic_source,
+    RustProjectSession, analyze_semantic_file_with_entries, analyze_semantic_project,
+    analyze_semantic_source,
 };
-use crate::language::{FileContext, LanguageFrontend};
+use crate::language::{FileContext, LanguageBackend, ProjectContext};
 use crate::model::{CallNode, FileAnalysis, SymbolId};
+
+static CARGO_SOURCE_LAYOUTS: OnceLock<Mutex<HashMap<PathBuf, Option<CargoSourceLayout>>>> =
+    OnceLock::new();
+
+#[derive(Clone)]
+struct CargoSourceLayout {
+    package_roots: Vec<PathBuf>,
+    target_sources: Vec<PathBuf>,
+}
 
 #[derive(Clone, Debug)]
 pub struct DiffOptions {
@@ -44,6 +55,7 @@ pub struct DiffReport {
     pub trees: Vec<EntryDiff>,
     pub message: Option<String>,
     pub analyzed_files: BTreeSet<PathBuf>,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +70,7 @@ pub struct TreeReport {
     pub source: String,
     pub trees: Vec<EntryTree>,
     pub message: Option<String>,
+    pub diagnostics: Vec<String>,
 }
 
 pub fn rustdiff_sources(
@@ -108,8 +121,88 @@ pub fn rustdiff_project_paths(
     wrapper_executable: &Path,
     options: &DiffOptions,
 ) -> DiffkitResult<DiffReport> {
-    let before = rust_project_graph(before_root, wrapper_executable, &options.entries)?;
-    let after = rust_project_graph(after_root, wrapper_executable, &options.entries)?;
+    let session = RustProjectSession::create()?;
+    rustdiff_project_paths_with_session(
+        before_root,
+        after_root,
+        wrapper_executable,
+        options,
+        &session,
+    )
+}
+
+pub fn rustdiff_project_paths_cached(
+    before_root: &Path,
+    after_root: &Path,
+    cache_project_root: &Path,
+    wrapper_executable: &Path,
+    options: &DiffOptions,
+    verbose: bool,
+) -> DiffkitResult<DiffReport> {
+    let before_session =
+        RustProjectSession::create_cached(cache_project_root, "git-before", verbose)?;
+    let after_session =
+        RustProjectSession::create_cached(cache_project_root, "git-after", verbose)?;
+    rustdiff_project_paths_with_sessions(
+        before_root,
+        after_root,
+        wrapper_executable,
+        options,
+        &before_session,
+        &after_session,
+    )
+}
+
+fn rustdiff_project_paths_with_session(
+    before_root: &Path,
+    after_root: &Path,
+    wrapper_executable: &Path,
+    options: &DiffOptions,
+    session: &RustProjectSession,
+) -> DiffkitResult<DiffReport> {
+    rustdiff_project_paths_with_sessions(
+        before_root,
+        after_root,
+        wrapper_executable,
+        options,
+        session,
+        session,
+    )
+}
+
+fn rustdiff_project_paths_with_sessions(
+    before_root: &Path,
+    after_root: &Path,
+    wrapper_executable: &Path,
+    options: &DiffOptions,
+    before_session: &RustProjectSession,
+    after_session: &RustProjectSession,
+) -> DiffkitResult<DiffReport> {
+    let (before, after) = if std::ptr::eq(before_session, after_session) {
+        (
+            rust_project_graph(
+                before_root,
+                wrapper_executable,
+                &options.entries,
+                before_session,
+            )?,
+            rust_project_graph(
+                after_root,
+                wrapper_executable,
+                &options.entries,
+                after_session,
+            )?,
+        )
+    } else {
+        rust_project_graphs_parallel(
+            before_root,
+            after_root,
+            wrapper_executable,
+            &options.entries,
+            before_session,
+            after_session,
+        )?
+    };
     build_report(
         "rust".to_owned(),
         before_root.display().to_string(),
@@ -125,12 +218,21 @@ pub fn rustdiff_project_files(
     after_file: &Path,
     wrapper_executable: &Path,
     options: &DiffOptions,
+    verbose: bool,
 ) -> DiffkitResult<Option<DiffReport>> {
     let before_root = find_cargo_root(before_file)?;
     let after_root = find_cargo_root(after_file)?;
-    let before = rust_project_graph(&before_root, wrapper_executable, &options.entries)?;
-    let after = rust_project_graph(&after_root, wrapper_executable, &options.entries)?;
-    if !before.has_functions_in_file(before_file) && !after.has_functions_in_file(after_file) {
+    let before_session = RustProjectSession::create_cached(&before_root, "file-before", verbose)?;
+    let after_session = RustProjectSession::create_cached(&after_root, "file-after", verbose)?;
+    let (before, after) = rust_project_graphs_parallel(
+        &before_root,
+        &after_root,
+        wrapper_executable,
+        &options.entries,
+        &before_session,
+        &after_session,
+    )?;
+    if !before.analyzes_file(before_file) && !after.analyzes_file(after_file) {
         return Ok(None);
     }
     build_file_report(
@@ -209,10 +311,12 @@ pub fn rusttree_project_file(
     path: &Path,
     wrapper_executable: &Path,
     options: &DiffOptions,
+    verbose: bool,
 ) -> DiffkitResult<Option<TreeReport>> {
     let root = find_cargo_root(path)?;
-    let graph = rust_project_graph(&root, wrapper_executable, &options.entries)?;
-    if !graph.has_functions_in_file(path) {
+    let session = RustProjectSession::create_cached(&root, "tree", verbose)?;
+    let graph = rust_project_graph(&root, wrapper_executable, &options.entries, &session)?;
+    if !graph.analyzes_file(path) {
         return Ok(None);
     }
     build_tree_report("rust", path, &graph, options).map(Some)
@@ -236,7 +340,7 @@ fn diff_sources(
     before_source: &str,
     after_name: String,
     after_source: &str,
-    frontend: &impl LanguageFrontend,
+    frontend: &impl LanguageBackend,
     options: &DiffOptions,
 ) -> DiffkitResult<DiffReport> {
     let empty_module = Vec::new();
@@ -286,6 +390,7 @@ fn build_report(
     let mut report = report_from_trees(language, before_name, after_name, trees);
     report.analyzed_files.extend(before.source_files());
     report.analyzed_files.extend(after.source_files());
+    report.diagnostics = comparison_diagnostics(before, after);
     Ok(report)
 }
 
@@ -300,19 +405,21 @@ fn build_file_report(
     let candidate_entries = if options.entries.is_empty() {
         ordered_file_root_union(before, after, before_path, after_path)
     } else {
-        resolve_explicit_entries(before, after, &options.entries)?
+        resolve_explicit_file_entries(before, after, before_path, after_path, &options.entries)?
             .into_iter()
             .collect()
     };
     let trees = candidate_entries
         .into_iter()
         .filter_map(|entry| {
-            let before_tree =
-                before.build_call_tree_in_file(&entry, options.max_depth, Some(before_path));
-            let after_tree =
-                after.build_call_tree_in_file(&entry, options.max_depth, Some(after_path));
-            let tree = diff_optional(before_tree.as_ref(), after_tree.as_ref())?;
-            tree_has_changes(&tree).then_some(EntryDiff { entry, tree })
+            let before_tree = before.build_call_tree_in_file(&entry, usize::MAX, Some(before_path));
+            let after_tree = after.build_call_tree_in_file(&entry, usize::MAX, Some(after_path));
+            let mut tree = diff_optional(before_tree.as_ref(), after_tree.as_ref())?;
+            tree_has_changes(&tree).then(|| {
+                collapse_unchanged_subtrees(&mut tree);
+                truncate_diff_tree(&mut tree, options.max_depth);
+                EntryDiff { entry, tree }
+            })
         })
         .collect();
     let mut report = report_from_trees(
@@ -323,6 +430,7 @@ fn build_file_report(
     );
     report.analyzed_files.extend(before.source_files());
     report.analyzed_files.extend(after.source_files());
+    report.diagnostics = comparison_diagnostics(before, after);
     Ok(report)
 }
 
@@ -338,10 +446,13 @@ fn build_tree_report(
         let mut resolved = Vec::new();
         for entry in &options.entries {
             let matches = graph
-                .resolve_entries(entry)
+                .resolve_entries_in_file(entry, path)
                 .map_err(std::io::Error::other)?;
             if matches.is_empty() {
-                return Err(std::io::Error::other(format!("entry not found: {entry}")).into());
+                return Err(std::io::Error::other(format!(
+                    "entry not found in selected file: {entry}"
+                ))
+                .into());
             }
             resolved.extend(matches);
         }
@@ -364,6 +475,7 @@ fn build_tree_report(
         source: path.display().to_string(),
         trees,
         message,
+        diagnostics: graph.resolution_diagnostics(),
     })
 }
 
@@ -450,7 +562,22 @@ fn report_from_trees(
         trees,
         message,
         analyzed_files: BTreeSet::new(),
+        diagnostics: Vec::new(),
     }
+}
+
+fn comparison_diagnostics(before: &ProgramGraph, after: &ProgramGraph) -> Vec<String> {
+    before
+        .resolution_diagnostics()
+        .into_iter()
+        .map(|diagnostic| format!("before: {diagnostic}"))
+        .chain(
+            after
+                .resolution_diagnostics()
+                .into_iter()
+                .map(|diagnostic| format!("after: {diagnostic}")),
+        )
+        .collect()
 }
 
 fn resolve_explicit_entries(
@@ -475,6 +602,33 @@ fn resolve_explicit_entries(
     Ok(resolved)
 }
 
+fn resolve_explicit_file_entries(
+    before: &ProgramGraph,
+    after: &ProgramGraph,
+    before_path: &Path,
+    after_path: &Path,
+    entries: &[String],
+) -> DiffkitResult<BTreeSet<SymbolId>> {
+    let mut resolved = BTreeSet::new();
+    for entry in entries {
+        let before_entries = before
+            .resolve_entries_in_file(entry, before_path)
+            .map_err(std::io::Error::other)?;
+        let after_entries = after
+            .resolve_entries_in_file(entry, after_path)
+            .map_err(std::io::Error::other)?;
+        if before_entries.is_empty() && after_entries.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "entry not found in selected file: {entry}"
+            ))
+            .into());
+        }
+        resolved.extend(before_entries);
+        resolved.extend(after_entries);
+    }
+    Ok(resolved)
+}
+
 fn changed_entries(
     before: &ProgramGraph,
     after: &ProgramGraph,
@@ -484,15 +638,19 @@ fn changed_entries(
     entries
         .into_iter()
         .filter_map(|entry| {
-            let before_tree = before.build_call_tree(&entry, max_depth);
-            let after_tree = after.build_call_tree(&entry, max_depth);
-            let tree = diff_optional(before_tree.as_ref(), after_tree.as_ref())?;
-            tree_has_changes(&tree).then_some(EntryDiff { entry, tree })
+            let before_tree = before.build_call_tree(&entry, usize::MAX);
+            let after_tree = after.build_call_tree(&entry, usize::MAX);
+            let mut tree = diff_optional(before_tree.as_ref(), after_tree.as_ref())?;
+            tree_has_changes(&tree).then(|| {
+                collapse_unchanged_subtrees(&mut tree);
+                truncate_diff_tree(&mut tree, max_depth);
+                EntryDiff { entry, tree }
+            })
         })
         .collect()
 }
 
-fn load_path(path: &Path, frontend: &impl LanguageFrontend) -> DiffkitResult<ProgramGraph> {
+fn load_path(path: &Path, frontend: &impl LanguageBackend) -> DiffkitResult<ProgramGraph> {
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -546,29 +704,60 @@ fn rust_project_graph(
     root: &Path,
     wrapper_executable: &Path,
     entries: &[String],
+    session: &RustProjectSession,
 ) -> DiffkitResult<ProgramGraph> {
     if !root.join("Cargo.toml").is_file() {
         return graph_from_files(std::iter::empty());
     }
-    graph_from_files([analyze_semantic_project(root, wrapper_executable, entries)?])
+    graph_from_files([analyze_semantic_project(
+        root,
+        wrapper_executable,
+        entries,
+        session,
+    )?])
+}
+
+fn rust_project_graphs_parallel(
+    before_root: &Path,
+    after_root: &Path,
+    wrapper_executable: &Path,
+    entries: &[String],
+    before_session: &RustProjectSession,
+    after_session: &RustProjectSession,
+) -> DiffkitResult<(ProgramGraph, ProgramGraph)> {
+    std::thread::scope(|scope| {
+        let before = scope
+            .spawn(|| rust_project_graph(before_root, wrapper_executable, entries, before_session));
+        let after = scope
+            .spawn(|| rust_project_graph(after_root, wrapper_executable, entries, after_session));
+        let before = before
+            .join()
+            .map_err(|_| std::io::Error::other("before Rust analysis worker panicked"))??;
+        let after = after
+            .join()
+            .map_err(|_| std::io::Error::other("after Rust analysis worker panicked"))??;
+        Ok((before, after))
+    })
 }
 
 fn ocaml_project_graph(
     root: &Path,
-    frontend: &impl LanguageFrontend,
+    frontend: &impl LanguageBackend,
 ) -> DiffkitResult<ProgramGraph> {
-    if root.is_dir() && root.join("dune-project").is_file() {
-        return graph_from_files([analyze_ocaml_project(root)?]);
-    }
     if root.is_dir() {
-        return graph_from_files([analyze_source_project(root)?]);
+        return graph_from_files([frontend.analyze_project(&ProjectContext {
+            root,
+            driver_executable: None,
+            entries: &[],
+            cache: None,
+        })?]);
     }
     load_path(root, frontend)
 }
 
 fn ocaml_optional_project_graph(
     root: &Path,
-    frontend: &impl LanguageFrontend,
+    frontend: &impl LanguageBackend,
 ) -> DiffkitResult<ProgramGraph> {
     if !root.exists() {
         return graph_from_files(std::iter::empty());
@@ -599,50 +788,64 @@ pub fn rust_file_is_project_source(path: &Path) -> bool {
         return false;
     };
     let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let Some(layout) = cargo_source_layout(&root) else {
+        return conventional_rust_source(&absolute, &root);
+    };
+    layout
+        .package_roots
+        .iter()
+        .any(|root| conventional_rust_source(&absolute, root))
+        || layout
+            .target_sources
+            .iter()
+            .any(|source| target_contains_source(source, &absolute))
+}
+
+fn cargo_source_layout(root: &Path) -> Option<CargoSourceLayout> {
+    let cache = CARGO_SOURCE_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(layout) = cache.lock().ok()?.get(root).cloned() {
+        return layout;
+    }
+
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(&root)
-        .output();
-    let Ok(output) = output else {
-        return conventional_rust_source(&absolute, &root);
-    };
-    if !output.status.success() {
-        return conventional_rust_source(&absolute, &root);
-    }
-    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-        return conventional_rust_source(&absolute, &root);
-    };
-    metadata
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|package| {
-            let package_root = package
-                .get("manifest_path")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|manifest| Path::new(manifest).parent());
-            if package_root.is_some_and(|root| conventional_rust_source(&absolute, root)) {
-                return true;
-            }
-            package
-                .get("targets")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|target| {
-                    target
-                        .get("kind")
+        .current_dir(root)
+        .output()
+        .ok();
+    let layout = output
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+        .and_then(|metadata| {
+            let packages = metadata.get("packages")?.as_array()?;
+            let package_roots = packages
+                .iter()
+                .filter_map(|package| package.get("manifest_path"))
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|manifest| Path::new(manifest).parent())
+                .map(Path::to_path_buf)
+                .collect();
+            let target_sources = packages
+                .iter()
+                .flat_map(|package| {
+                    package
+                        .get("targets")
                         .and_then(serde_json::Value::as_array)
                         .into_iter()
                         .flatten()
-                        .filter_map(serde_json::Value::as_str)
-                        .any(|kind| !matches!(kind, "test" | "bench"))
                 })
                 .filter_map(|target| target.get("src_path"))
                 .filter_map(serde_json::Value::as_str)
-                .any(|source| target_contains_source(Path::new(source), &absolute))
-        })
+                .map(PathBuf::from)
+                .collect();
+            Some(CargoSourceLayout {
+                package_roots,
+                target_sources,
+            })
+        });
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(root.to_path_buf(), layout.clone());
+    }
+    layout
 }
 
 fn conventional_rust_source(file: &Path, package_root: &Path) -> bool {
@@ -749,4 +952,15 @@ fn module_path(root: &Path, file: &Path) -> Vec<String> {
         parts.pop();
     }
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cargo_test_targets_are_project_sources() {
+        let test = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli.rs");
+        assert!(rust_file_is_project_source(&test));
+    }
 }

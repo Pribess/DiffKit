@@ -1,17 +1,19 @@
 #![feature(rustc_private)]
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::builder::styling::{AnsiColor, Styles};
+use clap::{Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use diffkit::git::GitComparison;
 use diffkit::language::rust::{run_rustc_wrapper, rustc_wrapper_requested};
 use diffkit::{
     ColorMode, DiffOptions, RenderOptions, ocamldiff_paths, ocamldiff_project_files,
     ocamldiff_sources, ocamltree_path, ocamltree_project_file, render_report_with_options,
-    render_tree_report_with_options, rustdiff_project_files, rustdiff_project_paths,
+    render_tree_report_with_options, rustdiff_project_files, rustdiff_project_paths_cached,
     rustdiff_sources, rusttree_path, rusttree_project_file,
 };
 
@@ -35,7 +37,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> diffkit::DiffkitResult<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let options = DiffOptions {
         entries: cli.entries,
         max_depth: cli.max_depth,
@@ -46,16 +48,67 @@ fn run() -> diffkit::DiffkitResult<()> {
     };
 
     match cli.command {
-        Some(Command::File(arguments)) => run_file(arguments, cli.language, &options, &render),
+        Some(Command::File(arguments)) => {
+            run_file(arguments, cli.language, &options, &render, cli.verbose)
+        }
         Some(Command::Git(arguments)) => run_git(
             &arguments.revisions,
             &arguments.pathspecs,
             cli.language,
             &options,
             &render,
+            cli.verbose,
         ),
-        None => run_git(&[], &cli.pathspecs, cli.language, &options, &render),
+        None => run_git(
+            &[],
+            &cli.pathspecs,
+            cli.language,
+            &options,
+            &render,
+            cli.verbose,
+        ),
     }
+}
+
+fn parse_cli() -> Cli {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    let matches = Cli::command()
+        .color(cli_color_choice(&arguments))
+        .get_matches_from(arguments);
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+fn cli_color_choice(arguments: &[OsString]) -> ColorChoice {
+    let mut choice = ColorChoice::Always;
+    let mut arguments = arguments.iter().skip(1);
+
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--color" {
+            if let Some(value) = arguments.next().and_then(|value| value.to_str()) {
+                choice = match value {
+                    "plain" => ColorChoice::Never,
+                    "ansi" => ColorChoice::Always,
+                    _ => choice,
+                };
+            }
+            continue;
+        }
+        if let Some(value) = argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix("--color="))
+        {
+            choice = match value {
+                "plain" => ColorChoice::Never,
+                "ansi" => ColorChoice::Always,
+                _ => choice,
+            };
+        }
+    }
+
+    choice
 }
 
 fn run_file(
@@ -63,6 +116,7 @@ fn run_file(
     language: Option<CliLanguage>,
     options: &DiffOptions,
     render: &RenderOptions,
+    verbose: bool,
 ) -> diffkit::DiffkitResult<()> {
     let detected = language.unwrap_or(detect_file_language(&arguments.before)?);
     let wrapper = std::env::current_exe()?;
@@ -81,7 +135,8 @@ fn run_file(
                 if diffkit::engine::rust_file_is_project_source(&arguments.before)
                     && diffkit::engine::rust_file_is_project_source(&after) =>
             {
-                match rustdiff_project_files(&arguments.before, &after, &wrapper, options)? {
+                match rustdiff_project_files(&arguments.before, &after, &wrapper, options, verbose)?
+                {
                     Some(report) => report,
                     None => rustdiff_standalone_files(&arguments.before, &after, options)?,
                 }
@@ -105,13 +160,16 @@ fn run_file(
                 )?
             }
         };
+        if verbose {
+            print_resolution_diagnostics(&report.diagnostics);
+        }
         println!("{}", render_report_with_options(&report, render));
     } else {
         let report = match detected {
             CliLanguage::Rust
                 if diffkit::engine::rust_file_is_project_source(&arguments.before) =>
             {
-                match rusttree_project_file(&arguments.before, &wrapper, options)? {
+                match rusttree_project_file(&arguments.before, &wrapper, options, verbose)? {
                     Some(report) => report,
                     None => rusttree_path(&arguments.before, options)?,
                 }
@@ -124,6 +182,9 @@ fn run_file(
             }
             CliLanguage::Ocaml => ocamltree_path(&arguments.before, options)?,
         };
+        if verbose {
+            print_resolution_diagnostics(&report.diagnostics);
+        }
         println!("{}", render_tree_report_with_options(&report, render));
     }
     Ok(())
@@ -151,6 +212,7 @@ fn run_git(
     language: Option<CliLanguage>,
     options: &DiffOptions,
     render: &RenderOptions,
+    verbose: bool,
 ) -> diffkit::DiffkitResult<()> {
     let comparison = GitComparison::discover(Path::new("."), revisions, pathspecs)?;
     if comparison.changed_paths.is_empty() {
@@ -205,7 +267,23 @@ fn run_git(
             if relevant_paths.is_empty() && !config_change {
                 continue;
             }
-            let mut report = rustdiff_project_paths(&before_root, &after_root, &wrapper, options)?;
+            if verbose {
+                print_analysis_progress(
+                    "Rust",
+                    &endpoint_project_label(before.label(), &relative_root),
+                    &endpoint_project_label(after.label(), &relative_root),
+                    render.color,
+                );
+            }
+            let cache_project_root = comparison.root.join(&relative_root);
+            let mut report = rustdiff_project_paths_cached(
+                &before_root,
+                &after_root,
+                &cache_project_root,
+                &wrapper,
+                options,
+                verbose,
+            )?;
             report.before = endpoint_project_label(before.label(), &relative_root);
             report.after = endpoint_project_label(after.label(), &relative_root);
             covered.extend(relevant_paths.iter().filter_map(|path| {
@@ -213,6 +291,9 @@ fn run_git(
                     || report_analyzes_path(&report, &after.path().join(path)))
                 .then_some(path.clone())
             }));
+            if verbose {
+                print_resolution_diagnostics(&report.diagnostics);
+            }
             if report.message.is_none() {
                 rendered.push(render_report_with_options(&report, render));
             }
@@ -228,6 +309,9 @@ fn run_git(
                 &read_source_or_empty(&after_path)?,
                 options,
             )?;
+            if verbose {
+                print_resolution_diagnostics(&report.diagnostics);
+            }
             if report.message.is_none() {
                 report.before = format!("{}:{}", before.label(), relative.display());
                 report.after = format!("{}:{}", after.label(), relative.display());
@@ -261,6 +345,9 @@ fn run_git(
                 )?;
                 report.before = endpoint_project_label(before.label(), &relative_root);
                 report.after = endpoint_project_label(after.label(), &relative_root);
+                if verbose {
+                    print_resolution_diagnostics(&report.diagnostics);
+                }
                 if report.message.is_none() {
                     rendered.push(render_report_with_options(&report, render));
                 }
@@ -279,6 +366,9 @@ fn run_git(
                     &read_source_or_empty(&after.path().join(relative))?,
                     options,
                 )?;
+                if verbose {
+                    print_resolution_diagnostics(&report.diagnostics);
+                }
                 if report.message.is_none() {
                     report.before = format!("{}:{}", before.label(), relative.display());
                     report.after = format!("{}:{}", after.label(), relative.display());
@@ -298,6 +388,20 @@ fn run_git(
         println!("{}", rendered.join("\n\n"));
     }
     Ok(())
+}
+
+fn print_resolution_diagnostics(diagnostics: &[String]) {
+    for diagnostic in diagnostics {
+        eprintln!("semantic resolution: {diagnostic}");
+    }
+}
+
+fn print_analysis_progress(language: &str, before: &str, after: &str, color: ColorMode) {
+    let message = format!("Analyzing {language} semantics: {before} → {after}…");
+    match color {
+        ColorMode::Ansi => eprintln!("\u{1b}[36m{message}\u{1b}[0m"),
+        ColorMode::Plain => eprintln!("{message}"),
+    }
 }
 
 fn endpoint_project_label(endpoint: &str, relative_root: &Path) -> String {
@@ -441,10 +545,19 @@ fn read_source_or_empty(path: &Path) -> std::io::Result<String> {
 
 /// Show semantic call-tree changes. With no subcommand, compare HEAD with the
 /// current Git worktree.
+const CLI_STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Cyan.on_default().bold())
+    .usage(AnsiColor::Cyan.on_default().bold())
+    .literal(AnsiColor::Green.on_default().bold())
+    .placeholder(AnsiColor::Yellow.on_default())
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Red.on_default());
+
 #[derive(Debug, Parser)]
 #[command(
     version,
     about,
+    styles = CLI_STYLES,
     after_help = "diffkit is shorthand for `diffkit git`. Languages are inferred from project and source files."
 )]
 struct Cli {
@@ -463,13 +576,17 @@ struct Cli {
     #[arg(long, global = true)]
     types: bool,
 
-    /// Select ANSI colors or plain output.
+    /// Force ANSI colors or select plain output.
     #[arg(long, value_enum, default_value_t, global = true)]
     color: CliColor,
 
-    /// Maximum expanded call depth.
+    /// Maximum displayed call depth; deeper changes remain marked.
     #[arg(long, default_value_t = 8, value_name = "N", global = true)]
     max_depth: usize,
+
+    /// Show semantic-analysis progress and cache diagnostics.
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
 
     /// Restrict the default Git diff to these paths. Must follow `--`.
     #[arg(last = true, value_name = "PATHSPEC")]
@@ -540,16 +657,20 @@ fn detect_file_language(path: &Path) -> diffkit::DiffkitResult<CliLanguage> {
 }
 
 fn language_from_extension(path: &Path) -> Option<CliLanguage> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "rs" => Some(CliLanguage::Rust),
-        "ml" | "mli" => Some(CliLanguage::Ocaml),
+    match diffkit::language::backend_for_extension(path)?
+        .language()
+        .0
+        .as_str()
+    {
+        "rust" => Some(CliLanguage::Rust),
+        "ocaml" => Some(CliLanguage::Ocaml),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use clap::{CommandFactory, Parser};
+    use clap::Parser;
 
     use super::*;
 
@@ -563,6 +684,32 @@ mod tests {
         let cli = Cli::try_parse_from(["diffkit"]).unwrap();
         assert!(cli.command.is_none());
         assert_eq!(cli.color, CliColor::Ansi);
+    }
+
+    #[test]
+    fn clap_color_defaults_to_always_and_plain_is_an_opt_out() {
+        assert_eq!(
+            cli_color_choice(&[OsString::from("diffkit"), OsString::from("-h")]),
+            ColorChoice::Always
+        );
+        assert_eq!(
+            cli_color_choice(&[
+                OsString::from("diffkit"),
+                OsString::from("--color=plain"),
+                OsString::from("-h"),
+            ]),
+            ColorChoice::Never
+        );
+        assert_eq!(
+            cli_color_choice(&[
+                OsString::from("diffkit"),
+                OsString::from("git"),
+                OsString::from("--color"),
+                OsString::from("plain"),
+                OsString::from("-h"),
+            ]),
+            ColorChoice::Never
+        );
     }
 
     #[test]
@@ -586,6 +733,13 @@ mod tests {
         assert_eq!(git.pathspecs, [PathBuf::from("src/payment.rs")]);
         assert_eq!(cli.entries, ["checkout"]);
         assert_eq!(cli.color, CliColor::Plain);
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn parses_verbose_as_a_global_flag() {
+        let cli = Cli::try_parse_from(["diffkit", "git", "-v"]).unwrap();
+        assert!(cli.verbose);
     }
 
     #[test]

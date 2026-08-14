@@ -1,14 +1,52 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RUST_PROJECT_FIXTURE: OnceLock<TestRepository> = OnceLock::new();
 
 fn fixture(relative: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/rust_project")
-        .join(relative)
+    let repository = RUST_PROJECT_FIXTURE.get_or_init(|| {
+        let repository = TestRepository::new();
+        repository.write(
+            "Cargo.toml",
+            "[package]\nname = \"fixture-project\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"src/lib.rs\"\n",
+        );
+        repository.write("src/lib.rs", "mod service;\nmod storage;\npub use service::entry;\n");
+        repository.write(
+            "src/service.rs",
+            "use crate::storage::{Postgres, Store};\n#[derive(Clone, Copy)]\npub struct Order;\npub fn entry(order: Order) { run(&Postgres, order); }\nfn run<S: Store>(storage: &S, order: Order) { storage.save(order); }\npub fn detached<S: Store>(storage: &S, order: Order) { storage.save(order); }\n",
+        );
+        repository.write(
+            "src/storage.rs",
+            "use crate::service::Order;\npub trait Store { fn save(&self, order: Order); }\npub struct Postgres;\nimpl Store for Postgres { fn save(&self, order: Order) { write(order); } }\nfn write(_order: Order) {}\n",
+        );
+        repository
+    });
+    repository.path().join(relative)
+}
+
+#[test]
+fn help_is_colored_by_default_even_when_no_color_is_set() {
+    let output = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .arg("-h")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.windows(2).any(|bytes| bytes == b"\x1b["));
+}
+
+#[test]
+fn plain_mode_removes_colors_from_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args(["--color=plain", "-h"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!output.stdout.windows(2).any(|bytes| bytes == b"\x1b["));
 }
 
 #[test]
@@ -26,6 +64,8 @@ fn file_command_uses_cargo_semantics_but_stops_at_the_selected_file() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("Analyzing Rust semantics"), "{stderr}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("entry(order)"), "{stdout}");
     assert!(
@@ -34,6 +74,24 @@ fn file_command_uses_cargo_semantics_but_stops_at_the_selected_file() {
     );
     assert!(stdout.contains("Postgres::save(order)"), "{stdout}");
     assert!(!stdout.contains("write(order)"), "{stdout}");
+}
+
+#[test]
+fn file_entry_must_be_declared_in_the_selected_file() {
+    let output = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args([
+            "file",
+            fixture("src/service.rs").to_str().unwrap(),
+            "--color=plain",
+            "-e",
+            "write",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("entry not found"), "{stderr}");
+    assert!(stderr.contains("selected file"), "{stderr}");
 }
 
 #[test]
@@ -177,6 +235,8 @@ fn default_git_mode_propagates_a_multifile_change_to_the_project_root() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("Analyzing Rust semantics"), "{stderr}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("main()"), "{stdout}");
     assert!(stdout.contains("entry()"), "{stdout}");
@@ -184,6 +244,72 @@ fn default_git_mode_propagates_a_multifile_change_to_the_project_root() {
         stdout.contains("+    └─ audit()") || stdout.contains("+     └─ audit()"),
         "{stdout}"
     );
+
+    let cached = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args(["--color=plain", "--verbose"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        cached.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cached.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&cached.stderr);
+    assert!(stderr.contains("Analyzing Rust semantics"), "{stderr}");
+    assert!(stderr.contains("cache hit: git-before"), "{stderr}");
+    assert!(stderr.contains("cache hit: git-after"), "{stderr}");
+
+    repository.write(
+        "src/service.rs",
+        "pub fn entry() { save(); audit(); trace(); }\nfn save() {}\nfn audit() {}\nfn trace() {}\n",
+    );
+    let invalidated = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args(["--color=plain", "--verbose"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        invalidated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invalidated.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&invalidated.stderr);
+    assert!(stderr.contains("cache hit: git-before"), "{stderr}");
+    assert!(stderr.contains("cache miss: git-after"), "{stderr}");
+}
+
+#[test]
+fn git_mode_treats_a_functionless_module_file_as_project_analyzed() {
+    let repository = TestRepository::new();
+    repository.write(
+        "Cargo.toml",
+        "[package]\nname = \"module-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    repository.write("src/lib.rs", "pub mod service;\n");
+    repository.write("src/service.rs", "pub fn run() {}\n");
+    repository.git(["init", "--quiet"]);
+    repository.git(["config", "user.email", "diffkit@example.invalid"]);
+    repository.git(["config", "user.name", "DiffKit Test"]);
+    repository.git(["add", "."]);
+    repository.git(["commit", "--quiet", "-m", "before"]);
+    repository.write(
+        "src/lib.rs",
+        "// The module file itself still has no function body.\npub mod service;\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args(["--color=plain"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("No call changes between HEAD and worktree."));
 }
 
 #[test]
@@ -301,6 +427,59 @@ fn git_mode_analyzes_standalone_ocaml_files_without_dune() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("run value"), "{stdout}");
     assert!(stdout.contains("audit value"), "{stdout}");
+}
+
+#[test]
+fn rust_context_crosses_a_workspace_crate_generic_body() {
+    let repository = TestRepository::new();
+    repository.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\", \"store-core\"]\nresolver = \"3\"\n",
+    );
+    repository.write(
+        "store-core/Cargo.toml",
+        "[package]\nname = \"store-core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    repository.write(
+        "store-core/src/lib.rs",
+        "pub trait Store { fn save(&self); }\npub fn run<T: Store>(store: T) { store.save(); }\npub fn run_dyn(store: &dyn Store) { store.save(); }\n",
+    );
+    repository.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nstore-core = { path = \"../store-core\" }\n",
+    );
+    repository.write(
+        "app/src/main.rs",
+        "struct Postgres;\nimpl store_core::Store for Postgres { fn save(&self) { write(); } }\nfn write() {}\nfn main() { store_core::run(Postgres); store_core::run_dyn(&Postgres); }\n",
+    );
+
+    repository.git(["init", "--quiet"]);
+    repository.git(["config", "user.email", "diffkit@example.invalid"]);
+    repository.git(["config", "user.name", "DiffKit Test"]);
+    repository.git(["add", "."]);
+    repository.git(["commit", "--quiet", "-m", "before"]);
+    repository.write(
+        "app/src/main.rs",
+        "struct Postgres;\nimpl store_core::Store for Postgres { fn save(&self) { write(); } }\nfn write() { audit(); }\nfn audit() {}\nfn main() { store_core::run(Postgres); store_core::run_dyn(&Postgres); }\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args(["--color=plain", "-e", "main"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("main()"), "{stdout}");
+    assert!(stdout.contains("run<Postgres>(Postgres)"), "{stdout}");
+    assert!(stdout.contains("run_dyn(&Postgres)"), "{stdout}");
+    assert!(stdout.contains("dyn Store::save()"), "{stdout}");
+    assert!(stdout.contains("Postgres::save()"), "{stdout}");
+    assert!(stdout.contains("audit()"), "{stdout}");
 }
 
 struct TestRepository {

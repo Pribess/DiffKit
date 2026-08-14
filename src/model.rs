@@ -1,9 +1,33 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+/// Stable identity of a semantic definition inside one analyzed program.
+///
+/// `SymbolId` is the public, language-neutral representation of a definition;
+/// this alias makes the distinction between definition and edge identities
+/// explicit in the graph/diff layers without duplicating the symbol payload.
+pub type NodeId = SymbolId;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+pub struct CallSiteId(pub String);
+
+impl CallSiteId {
+    pub fn source(syntax: &CallSyntax, span: &SourceSpan) -> Self {
+        Self(format!(
+            "{}@{}:{}-{}:{}",
+            syntax.key_fragment(),
+            span.start_line,
+            span.start_column,
+            span.end_line,
+            span.end_column
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub struct LanguageId(pub String);
 
 impl LanguageId {
@@ -18,7 +42,7 @@ impl fmt::Display for LanguageId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub struct SymbolId {
     pub language: LanguageId,
     pub module: Vec<String>,
@@ -63,7 +87,7 @@ pub struct SourceSpan {
     pub end_byte: Option<usize>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CallSyntax {
     Path(Vec<String>),
     SelfMethod(String),
@@ -80,8 +104,13 @@ impl CallSyntax {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CallSite {
+    /// Identity of this source call edge. Backends derive it from the owning
+    /// definition and the call's structural source identity. It is kept
+    /// separate from the callee because one function may call the same target
+    /// more than once.
+    pub id: CallSiteId,
     pub syntax: CallSyntax,
     /// Authoritative semantic target supplied by rustc_public, OCaml Typedtree, or
     /// another language backend. Syntax-only frontends use `Unresolved` and
@@ -93,16 +122,70 @@ pub struct CallSite {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CallTarget {
     #[default]
     Unresolved,
+    /// A typed indirect call whose concrete callable value is not known.
+    /// This is intentionally distinct from a syntax-resolution failure.
+    Indirect {
+        signature: Option<String>,
+        reason: UnresolvedReason,
+    },
     Direct(SymbolId),
     Dynamic {
         dispatch: SymbolId,
         candidates: Vec<DispatchCandidate>,
         resolution: DispatchResolution,
+        evidence: DispatchEvidence,
+        unresolved_reasons: BTreeSet<UnresolvedReason>,
     },
+}
+
+/// Why a candidate set is justified when it is complete.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DispatchEvidence {
+    /// Concrete values were followed to this exact call site.
+    #[default]
+    ExactFlow,
+    /// The backend proved a closed candidate universe for this call site.
+    ClosedSet,
+}
+
+impl fmt::Display for DispatchEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ExactFlow => "exact-flow",
+            Self::ClosedSet => "closed-set",
+        })
+    }
+}
+
+/// Machine-readable causes for an unresolved or partially resolved call.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum UnresolvedReason {
+    OpaqueInput,
+    ExternalCode,
+    ExternalMemory,
+    FunctionPointer,
+    CrossCrateBoundary,
+    AnalysisLimit,
+    UnsupportedConstruct,
+}
+
+impl fmt::Display for UnresolvedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::OpaqueInput => "opaque input",
+            Self::ExternalCode => "external code",
+            Self::ExternalMemory => "external memory",
+            Self::FunctionPointer => "function pointer",
+            Self::CrossCrateBoundary => "cross-crate boundary",
+            Self::AnalysisLimit => "analysis limit",
+            Self::UnsupportedConstruct => "unsupported construct",
+        };
+        f.write_str(text)
+    }
 }
 
 /// How completely a language backend resolved an indirect call site.
@@ -110,7 +193,7 @@ pub enum CallTarget {
 /// Candidate names are emitted only when the backend has evidence that the
 /// callable value can reach the call site. `Partial` keeps those proven
 /// candidates while recording that another, opaque source may also reach it.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DispatchResolution {
     #[default]
     Complete,
@@ -118,13 +201,13 @@ pub enum DispatchResolution {
     Unresolved,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DispatchCandidate {
     pub target: SymbolId,
     pub label: CallLabel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CallLabel {
     pub default: String,
     pub typed: Option<String>,
@@ -161,7 +244,7 @@ impl CallLabel {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FunctionInfo {
     pub id: SymbolId,
     /// Declaration-shaped label used only when this function is a tree root.
@@ -171,7 +254,7 @@ pub struct FunctionInfo {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LanguageFact {
     pub subject: SymbolId,
     pub namespace: LanguageId,
@@ -181,15 +264,27 @@ pub struct LanguageFact {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct FileAnalysis {
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SemanticCallGraph {
     pub functions: Vec<FunctionInfo>,
     pub facts: Vec<LanguageFact>,
+    /// Source files successfully consumed by the frontend, including files
+    /// that declare no callable functions.
+    pub source_files: BTreeSet<PathBuf>,
+    /// Compiler-provided roots when the backend has authoritative entry
+    /// information. The common graph infers component roots only when empty.
+    pub roots: BTreeSet<SymbolId>,
 }
+
+/// Compatibility name for the per-file graph fragment returned by source
+/// adapters. Project backends return the same language-neutral graph shape.
+pub type FileAnalysis = SemanticCallGraph;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallNode {
     pub key: String,
+    /// The edge that introduced this node. Roots have no call-site identity.
+    pub callsite: Option<CallSiteId>,
     pub label: CallLabel,
     /// The relationship from the parent node to this node. Roots use `Call`.
     pub relation: CallRelation,

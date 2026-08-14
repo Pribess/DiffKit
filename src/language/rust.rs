@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -19,25 +20,33 @@ use rustc_public::ty::{
     AssocContainer, ExistentialTraitRef, RigidTy, TraitRef, Ty, TyKind, VtblEntry,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
+use syn::visit_mut::{self, VisitMut};
 use syn::{
     Expr, ExprCall, ExprClosure, ExprMethodCall, FnArg, ImplItem, Item, ItemFn, ItemImpl,
     ItemTrait, Pat, ReturnType, Signature, TraitItem, Visibility,
 };
 
-use super::{FileContext, FrontendResult, LanguageFrontend};
+use super::{FileContext, FrontendResult, LanguageBackend, ProjectContext};
 use crate::model::{
-    CallLabel, CallSite, CallSyntax, CallTarget, DispatchCandidate, DispatchResolution,
-    FileAnalysis, FunctionInfo, LanguageFact, LanguageId, SourceSpan, SymbolId,
+    CallLabel, CallSite, CallSiteId, CallSyntax, CallTarget, DispatchCandidate, DispatchEvidence,
+    DispatchResolution, FileAnalysis, FunctionInfo, LanguageFact, LanguageId, SourceSpan, SymbolId,
+    UnresolvedReason,
 };
 
 #[derive(Default)]
-struct RustSourceExtractor;
+pub struct RustBackend;
+
+pub static RUST_BACKEND: RustBackend = RustBackend;
 
 static RUSTC_DRIVER_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_SOURCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RUSTC_CAPTURE_DIRECTORY: &str = "DIFFKIT_RUSTC_CAPTURE_DIRECTORY";
+const RUSTC_ANALYSIS_ROOT: &str = "DIFFKIT_RUSTC_ANALYSIS_ROOT";
+const SNAPSHOT_FINGERPRINT_FILE: &str = ".diffkit-snapshot-key";
+const RUST_SEMANTIC_CACHE_SCHEMA: u32 = 2;
 
 /// Analyze a standalone, compilable Rust source file with rustc's typed MIR.
 ///
@@ -61,7 +70,7 @@ pub fn analyze_semantic_file_with_entries(
     }
 
     let source = fs::read_to_string(path)?;
-    let syntax = RustSourceExtractor.analyze_file(&FileContext { path, module: &[] }, &source)?;
+    let syntax = RustBackend.analyze_file(&FileContext { path, module: &[] }, &source)?;
     let semantic = collect_rustc_program(path)?;
     let analysis = merge_semantic_program(syntax.clone(), semantic);
     let missing_entries = entries
@@ -129,18 +138,6 @@ pub fn run_rustc_wrapper() -> FrontendResult<()> {
             .collect::<Result<Vec<_>, _>>()?,
     );
 
-    // rustc_public's traversal can stall in generated test-harness lowering.
-    // Cargo still needs that artifact, so compile it with the original rustc.
-    // Changed test-only files are handled by the standalone-file fallback.
-    if arguments.iter().any(|argument| argument == "--test") {
-        let status = Command::new(&rustc).args(&arguments).status()?;
-        return if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!("rustc test target exited with {status}")).into())
-        };
-    }
-
     let program = match rustc_public::run!(&driver_arguments, || {
         std::ops::ControlFlow::<(), SemanticProgram>::Continue(collect_instances())
     }) {
@@ -173,10 +170,11 @@ fn persist_semantic_program(program: &SemanticProgram) -> FrontendResult<()> {
 /// Analyze every Rust target selected by Cargo under `project_root` using the
 /// exact rustc invocations Cargo produced. The returned graph fragment is the
 /// only representation that crosses into DiffKit's common engine.
-pub fn analyze_semantic_project(
+pub(crate) fn analyze_semantic_project(
     project_root: &Path,
     wrapper_executable: &Path,
     entries: &[String],
+    session: &RustProjectSession,
 ) -> FrontendResult<FileAnalysis> {
     let root = project_root.canonicalize()?;
     if !root.join("Cargo.toml").is_file() {
@@ -192,12 +190,12 @@ pub fn analyze_semantic_project(
         .cloned()
         .collect::<Vec<_>>();
     if generic_entries.is_empty() {
-        return capture_semantic_project(&root, wrapper_executable);
+        return capture_semantic_project(&root, wrapper_executable, session);
     }
 
     let seeded = SeededRustProject::create(&root)?;
     seed_project_entries(seeded.root(), &generic_entries)?;
-    let mut analysis = capture_semantic_project(seeded.root(), wrapper_executable)?;
+    let mut analysis = capture_semantic_project(seeded.root(), wrapper_executable, session)?;
     remap_analysis_root(&mut analysis, seeded.root(), &root);
     remove_seed_functions(&mut analysis);
     Ok(analysis)
@@ -206,15 +204,59 @@ pub fn analyze_semantic_project(
 fn capture_semantic_project(
     root: &Path,
     wrapper_executable: &Path,
+    session: &RustProjectSession,
 ) -> FrontendResult<FileAnalysis> {
-    let wrapper = wrapper_executable.canonicalize()?;
+    let started = std::time::Instant::now();
+    let fingerprint_started = std::time::Instant::now();
+    let fingerprint = session
+        .cache_path()
+        .map(|_| semantic_cache_fingerprint(root, wrapper_executable))
+        .transpose()?;
+    let fingerprint_elapsed = fingerprint_started.elapsed();
+    // `cargo clean --workspace` and the following check form one operation.
+    // Cargo's own target lock covers each command separately, so another
+    // DiffKit process could otherwise clean between them and then observe a
+    // fresh build without receiving any semantic wrapper output.
+    let cache_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(session.target().join(".diffkit.lock"))?;
+    cache_lock.lock()?;
+    if let (Some(cache_path), Some(fingerprint)) = (session.cache_path(), fingerprint.as_deref())
+        && let Some(analysis) = read_analysis_cache(cache_path, fingerprint, root)
+    {
+        session.report_cache(true, fingerprint, fingerprint_elapsed, started.elapsed());
+        return Ok(analysis);
+    }
     let capture = RustProjectCapture::create()?;
+    let wrapper = wrapper_executable.canonicalize()?;
+    let clean = Command::new("cargo")
+        .args(["clean", "--workspace", "--quiet"])
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", session.target())
+        .output()?;
+    if !clean.status.success() {
+        let diagnostic = String::from_utf8_lossy(&clean.stderr).trim().to_owned();
+        return Err(std::io::Error::other(if diagnostic.is_empty() {
+            format!("Cargo cache preparation exited with {}", clean.status)
+        } else {
+            diagnostic
+        })
+        .into());
+    }
     let output = Command::new("cargo")
         .args(["check", "--workspace", "--all-targets", "--quiet"])
         .current_dir(root)
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
         .env(RUSTC_CAPTURE_DIRECTORY, capture.results())
-        .env("CARGO_TARGET_DIR", capture.target())
+        .env(RUSTC_ANALYSIS_ROOT, root)
+        .env("CARGO_TARGET_DIR", session.target())
+        // Before and after snapshots have different source roots. Reusing
+        // rustc incremental state across those roots can mix stale module
+        // paths even though Cargo correctly reruns the workspace target.
+        .env("CARGO_INCREMENTAL", "0")
         .output()?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -264,11 +306,217 @@ fn capture_semantic_project(
             && left.body_span.start_line == right.body_span.start_line
             && left.body_span.start_column == right.body_span.start_column
     });
+    respecialize_merged_semantic_program(&mut semantic);
 
     let syntax = analyze_project_sources(root)?;
-    Ok(deduplicate_analysis(merge_semantic_program(
-        syntax, semantic,
-    )))
+    let analysis = deduplicate_analysis(merge_semantic_program(syntax, semantic));
+    if let (Some(cache_path), Some(fingerprint)) = (session.cache_path(), fingerprint) {
+        let cache = CachedRustAnalysis {
+            schema: RUST_SEMANTIC_CACHE_SCHEMA,
+            fingerprint,
+            root: root.to_path_buf(),
+            analysis,
+        };
+        let _ = write_analysis_cache(cache_path, &cache);
+        session.report_cache(
+            false,
+            &cache.fingerprint,
+            fingerprint_elapsed,
+            started.elapsed(),
+        );
+        return Ok(cache.analysis);
+    }
+    Ok(analysis)
+}
+
+fn semantic_cache_fingerprint(root: &Path, wrapper_executable: &Path) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    hash_cache_bytes(&mut hasher, &RUST_SEMANTIC_CACHE_SCHEMA.to_le_bytes());
+    hash_cache_bytes(&mut hasher, &analyzer_identity(wrapper_executable)?);
+    hash_command_identity(&mut hasher, root, "rustc", &["-vV"])?;
+    hash_command_identity(&mut hasher, root, "cargo", &["-V"])?;
+
+    let mut environment = env::vars_os()
+        .filter(|(key, _)| rust_build_environment_key(key))
+        .collect::<Vec<_>>();
+    environment.sort_by(|left, right| {
+        left.0
+            .as_encoded_bytes()
+            .cmp(right.0.as_encoded_bytes())
+            .then_with(|| left.1.as_encoded_bytes().cmp(right.1.as_encoded_bytes()))
+    });
+    for (key, value) in environment {
+        hash_cache_bytes(&mut hasher, key.as_encoded_bytes());
+        hash_cache_bytes(&mut hasher, value.as_encoded_bytes());
+    }
+    if let Ok(snapshot_key) = fs::read(root.join(SNAPSHOT_FINGERPRINT_FILE)) {
+        hash_cache_bytes(&mut hasher, b"git-snapshot");
+        hash_cache_bytes(&mut hasher, &snapshot_key);
+    } else {
+        hash_project_inputs(root, root, &mut hasher)?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn rust_build_environment_key(key: &std::ffi::OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return true;
+    };
+    matches!(
+        key,
+        "PATH"
+            | "HOME"
+            | "RUSTFLAGS"
+            | "RUSTDOCFLAGS"
+            | "RUSTC"
+            | "RUSTUP_HOME"
+            | "RUSTUP_TOOLCHAIN"
+            | "CARGO_HOME"
+            | "CARGO_BUILD_TARGET"
+            | "CARGO_ENCODED_RUSTFLAGS"
+            | "CC"
+            | "CXX"
+            | "AR"
+            | "CFLAGS"
+            | "CXXFLAGS"
+            | "LDFLAGS"
+            | "MACOSX_DEPLOYMENT_TARGET"
+            | "SDKROOT"
+            | "PKG_CONFIG_PATH"
+    ) || [
+        "CARGO_PROFILE_",
+        "CARGO_TARGET_",
+        "RUSTC_",
+        "CC_",
+        "CXX_",
+        "AR_",
+        "CFLAGS_",
+        "CXXFLAGS_",
+        "PKG_CONFIG_",
+    ]
+    .iter()
+    .any(|prefix| key.starts_with(prefix))
+}
+
+fn analyzer_identity(wrapper_executable: &Path) -> std::io::Result<Vec<u8>> {
+    let metadata = wrapper_executable.metadata()?;
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Ok(format!(
+        "{}:{}:{}:{}",
+        env!("CARGO_PKG_VERSION"),
+        metadata.len(),
+        modified.as_secs(),
+        modified.subsec_nanos()
+    )
+    .into_bytes())
+}
+
+fn hash_command_identity(
+    hasher: &mut Sha256,
+    root: &Path,
+    program: &str,
+    arguments: &[&str],
+) -> std::io::Result<()> {
+    let output = Command::new(program)
+        .args(arguments)
+        .current_dir(root)
+        .output()?;
+    hash_cache_bytes(hasher, program.as_bytes());
+    hash_cache_bytes(hasher, &output.stdout);
+    hash_cache_bytes(hasher, &output.stderr);
+    hash_cache_bytes(hasher, &output.status.code().unwrap_or(-1).to_le_bytes());
+    Ok(())
+}
+
+fn hash_project_inputs(root: &Path, directory: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::path);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if !is_generated_directory(&path) {
+                hash_project_inputs(root, &path, hasher)?;
+            }
+            continue;
+        }
+
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        if file_type.is_file() {
+            hash_cache_bytes(hasher, b"file");
+            hash_cache_bytes(hasher, relative.as_os_str().as_encoded_bytes());
+            hash_file_contents(&path, hasher)?;
+        } else if file_type.is_symlink() {
+            hash_cache_bytes(hasher, b"symlink");
+            hash_cache_bytes(hasher, relative.as_os_str().as_encoded_bytes());
+            let target = fs::read_link(&path)?;
+            hash_cache_bytes(hasher, target.as_os_str().as_encoded_bytes());
+            if let Ok(resolved) = path.canonicalize()
+                && resolved.is_file()
+            {
+                hash_file_contents(&resolved, hasher)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_generated_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".git" | "target" | "node_modules" | ".zig-cache" | "zig-out" | "_build")
+    )
+}
+
+fn hash_file_contents(path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    let mut file = fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    hasher.update(length.to_le_bytes());
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(())
+}
+
+fn hash_cache_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn read_analysis_cache(path: PathBuf, fingerprint: &str, root: &Path) -> Option<FileAnalysis> {
+    let mut cached = serde_json::from_slice::<CachedRustAnalysis>(&fs::read(path).ok()?).ok()?;
+    if cached.schema != RUST_SEMANTIC_CACHE_SCHEMA || cached.fingerprint != fingerprint {
+        return None;
+    }
+    remap_analysis_root(&mut cached.analysis, &cached.root, root);
+    Some(cached.analysis)
+}
+
+fn write_analysis_cache(path: PathBuf, cached: &CachedRustAnalysis) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let sequence = TEMP_SOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("json.tmp-{}-{sequence}", std::process::id()));
+    fs::write(&temporary, serde_json::to_vec(cached)?)?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        if path.is_file() {
+            fs::remove_file(&path)?;
+            fs::rename(&temporary, &path)?;
+        } else {
+            let _ = fs::remove_file(temporary);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 struct RustProjectCapture {
@@ -279,7 +527,7 @@ impl RustProjectCapture {
     fn create() -> std::io::Result<Self> {
         let sequence = TEMP_SOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory = env::temp_dir().join(format!(
-            "diffkit-rust-project-{}-{sequence}",
+            "diffkit-rust-capture-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&directory)?;
@@ -290,15 +538,105 @@ impl RustProjectCapture {
     fn results(&self) -> PathBuf {
         self.directory.join("results")
     }
-
-    fn target(&self) -> PathBuf {
-        self.directory.join("target")
-    }
 }
 
 impl Drop for RustProjectCapture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Owns one Cargo target directory for one semantic-analysis endpoint.
+///
+/// A before/after comparison must not share a persistent target directory:
+/// Cargo identifies workspace packages independently of the temporary Git
+/// snapshot path, so a binary from one endpoint can otherwise be checked
+/// against stale library metadata from the other endpoint.
+pub(crate) struct RustProjectSession {
+    target: PathBuf,
+    cleanup: Option<PathBuf>,
+    endpoint: Option<String>,
+    verbose: bool,
+}
+
+impl RustProjectSession {
+    pub(crate) fn create() -> std::io::Result<Self> {
+        let sequence = TEMP_SOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = env::temp_dir().join(format!(
+            "diffkit-rust-session-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory)?;
+        Ok(Self {
+            target: directory.join("target"),
+            cleanup: Some(directory),
+            endpoint: None,
+            verbose: false,
+        })
+    }
+
+    pub(crate) fn create_cached(
+        project_root: &Path,
+        endpoint: &str,
+        verbose: bool,
+    ) -> std::io::Result<Self> {
+        let mut components = Path::new(endpoint).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Rust semantic cache endpoint must be one path component",
+            ));
+        }
+        let target = project_root
+            .join("target")
+            .join("diffkit-semantic")
+            .join(endpoint);
+        fs::create_dir_all(&target)?;
+        Ok(Self {
+            target,
+            cleanup: None,
+            endpoint: Some(endpoint.to_owned()),
+            verbose,
+        })
+    }
+
+    fn target(&self) -> &Path {
+        &self.target
+    }
+
+    fn cache_path(&self) -> Option<PathBuf> {
+        self.cleanup
+            .is_none()
+            .then(|| self.target.join(".diffkit").join("analysis-v2.json"))
+    }
+
+    fn report_cache(
+        &self,
+        hit: bool,
+        fingerprint_key: &str,
+        fingerprint: std::time::Duration,
+        total: std::time::Duration,
+    ) {
+        if self.verbose {
+            let status = if hit { "hit" } else { "miss" };
+            eprintln!(
+                "Rust semantic cache {status}: {} [{}] ({} ms; fingerprint {} ms)",
+                self.endpoint.as_deref().unwrap_or("temporary"),
+                &fingerprint_key[..fingerprint_key.len().min(12)],
+                total.as_millis(),
+                fingerprint.as_millis(),
+            );
+        }
+    }
+}
+
+impl Drop for RustProjectSession {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.cleanup {
+            let _ = fs::remove_dir_all(directory);
+        }
     }
 }
 
@@ -400,6 +738,13 @@ fn remap_analysis_root(analysis: &mut FileAnalysis, from: &Path, to: &Path) {
     for fact in &mut analysis.facts {
         remap(&mut fact.span.file);
     }
+    analysis.source_files = std::mem::take(&mut analysis.source_files)
+        .into_iter()
+        .map(|mut file| {
+            remap(&mut file);
+            file
+        })
+        .collect();
 }
 
 fn remove_seed_functions(analysis: &mut FileAnalysis) {
@@ -423,7 +768,7 @@ fn analyze_project_sources(root: &Path) -> FrontendResult<FileAnalysis> {
     for file in files {
         let source = fs::read_to_string(&file)?;
         let module = rust_module_path(root, &file);
-        let mut analysis = RustSourceExtractor.analyze_file(
+        let mut analysis = RustBackend.analyze_file(
             &FileContext {
                 path: &file,
                 module: &module,
@@ -432,6 +777,7 @@ fn analyze_project_sources(root: &Path) -> FrontendResult<FileAnalysis> {
         )?;
         combined.functions.append(&mut analysis.functions);
         combined.facts.append(&mut analysis.facts);
+        combined.source_files.append(&mut analysis.source_files);
     }
     Ok(combined)
 }
@@ -504,6 +850,8 @@ fn deduplicate_analysis(analysis: FileAnalysis) -> FileAnalysis {
     FileAnalysis {
         functions: functions.into_values().collect(),
         facts: analysis.facts,
+        source_files: analysis.source_files,
+        roots: analysis.roots,
     }
 }
 
@@ -640,12 +988,23 @@ struct SemanticProgram {
     functions: Vec<SemanticFunction>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedRustAnalysis {
+    schema: u32,
+    fingerprint: String,
+    root: PathBuf,
+    analysis: FileAnalysis,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct SemanticFunction {
+    base_key: String,
     key: String,
     display: String,
     body_span: SourceSpan,
     calls: Vec<SemanticCall>,
+    constructor_spans: Vec<SourceSpan>,
+    constructor_names: Vec<String>,
     parameter_types: Vec<String>,
 }
 
@@ -655,6 +1014,14 @@ struct SemanticCall {
     definition_name: String,
     span: SourceSpan,
     argument_types: Vec<String>,
+    argument_flows: Vec<SemanticDynFlow>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SemanticDynFlow {
+    concrete_types: Vec<String>,
+    parameters: Vec<usize>,
+    unresolved_reasons: BTreeSet<UnresolvedReason>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -668,7 +1035,13 @@ enum SemanticCallTarget {
         display: String,
         candidates: Vec<SemanticDispatchCandidate>,
         open: bool,
+        unresolved_reasons: BTreeSet<UnresolvedReason>,
+        receiver_flow: SemanticDynFlow,
     },
+    Indirect {
+        signature: String,
+    },
+    Unresolved,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -681,7 +1054,7 @@ struct SemanticDispatchCandidate {
 struct DynFlow {
     concrete: Vec<TraitRef>,
     parameters: Vec<usize>,
-    unknown: bool,
+    unresolved_reasons: BTreeSet<UnresolvedReason>,
 }
 
 impl DynFlow {
@@ -689,7 +1062,7 @@ impl DynFlow {
         Self {
             concrete: Vec::new(),
             parameters: vec![index],
-            unknown: false,
+            unresolved_reasons: BTreeSet::new(),
         }
     }
 
@@ -697,20 +1070,20 @@ impl DynFlow {
         Self {
             concrete: vec![trait_ref],
             parameters: Vec::new(),
-            unknown: false,
+            unresolved_reasons: BTreeSet::new(),
         }
     }
 
-    fn unknown() -> Self {
+    fn unresolved(reason: UnresolvedReason) -> Self {
         Self {
             concrete: Vec::new(),
             parameters: Vec::new(),
-            unknown: true,
+            unresolved_reasons: [reason].into_iter().collect(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.concrete.is_empty() && self.parameters.is_empty() && !self.unknown
+        self.concrete.is_empty() && self.parameters.is_empty() && self.unresolved_reasons.is_empty()
     }
 
     fn merge(&mut self, other: &Self) -> bool {
@@ -727,9 +1100,8 @@ impl DynFlow {
                 changed = true;
             }
         }
-        if other.unknown && !self.unknown {
-            self.unknown = true;
-            changed = true;
+        for reason in &other.unresolved_reasons {
+            changed |= self.unresolved_reasons.insert(reason.clone());
         }
         self.parameters.sort_unstable();
         changed
@@ -739,7 +1111,7 @@ impl DynFlow {
 #[derive(Clone, Debug, Default)]
 struct ResolvedDynFlow {
     concrete: Vec<TraitRef>,
-    unknown: bool,
+    unresolved_reasons: BTreeSet<UnresolvedReason>,
 }
 
 impl ResolvedDynFlow {
@@ -749,7 +1121,8 @@ impl ResolvedDynFlow {
                 self.concrete.push(candidate.clone());
             }
         }
-        self.unknown |= other.unknown;
+        self.unresolved_reasons
+            .extend(other.unresolved_reasons.iter().cloned());
     }
 }
 
@@ -759,6 +1132,8 @@ struct RawSemanticFunction {
     display: String,
     body_span: SourceSpan,
     calls: Vec<RawSemanticCall>,
+    constructor_spans: Vec<SourceSpan>,
+    constructor_names: Vec<String>,
     parameter_types: Vec<String>,
 }
 
@@ -783,6 +1158,10 @@ enum RawSemanticCallTarget {
         display: String,
         receiver: DynFlow,
     },
+    Indirect {
+        signature: String,
+    },
+    Unresolved,
 }
 
 #[derive(Clone)]
@@ -874,7 +1253,11 @@ fn collect_instances() -> SemanticProgram {
     if !summaries_converged {
         for item in &instance_bodies {
             if type_contains_dyn(item.body.ret_local().ty) {
-                return_summaries.entry(item.instance).or_default().unknown = true;
+                return_summaries
+                    .entry(item.instance)
+                    .or_default()
+                    .unresolved_reasons
+                    .insert(UnresolvedReason::AnalysisLimit);
             }
         }
     }
@@ -890,32 +1273,42 @@ fn collect_instances() -> SemanticProgram {
             let TerminatorKind::Call { func, args, .. } = &block.terminator.kind else {
                 continue;
             };
-            let Some(target) = resolve_called_instance(body, func) else {
-                continue;
-            };
-            let name = target.name();
-            let definition_name = target.def.name();
+            let resolved_target = resolve_called_instance(body, func);
+            let definition_name = resolved_target
+                .map(|target| target.def.name())
+                .unwrap_or_default();
             let call_flow = analysis
                 .calls
                 .get(block_index)
                 .and_then(Option::as_ref)
                 .cloned()
                 .unwrap_or_default();
-            let target = match target.kind {
-                InstanceKind::Virtual { .. } => RawSemanticCallTarget::Dynamic {
-                    dispatch: target,
-                    key: normalize_instance_key(&name),
-                    display: normalize_instance_display(&name, &crate_name),
-                    receiver: call_flow
-                        .arguments
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(DynFlow::unknown),
-                },
-                _ => RawSemanticCallTarget::Direct {
-                    key: normalize_instance_key(&name),
-                    display: normalize_instance_display(&name, &crate_name),
-                },
+            let target = match resolved_target {
+                Some(target) => {
+                    let name = target.name();
+                    match target.kind {
+                        InstanceKind::Virtual { .. } => RawSemanticCallTarget::Dynamic {
+                            dispatch: target,
+                            key: normalize_instance_key(&name),
+                            display: normalize_instance_display(&name, &crate_name),
+                            receiver: call_flow.arguments.first().cloned().unwrap_or_else(|| {
+                                DynFlow::unresolved(UnresolvedReason::AnalysisLimit)
+                            }),
+                        },
+                        _ => RawSemanticCallTarget::Direct {
+                            key: normalize_instance_key(&name),
+                            display: normalize_instance_display(&name, &crate_name),
+                        },
+                    }
+                }
+                None => func
+                    .ty(body.locals())
+                    .ok()
+                    .filter(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::FnPtr(_))))
+                    .map(|ty| RawSemanticCallTarget::Indirect {
+                        signature: normalize_type_display(&ty.to_string(), &crate_name),
+                    })
+                    .unwrap_or(RawSemanticCallTarget::Unresolved),
             };
             calls.push(RawSemanticCall {
                 target,
@@ -937,11 +1330,41 @@ fn collect_instances() -> SemanticProgram {
                 call.span.end_column,
             )
         });
+        let mut constructor_spans = body
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .filter_map(|statement| {
+                let StatementKind::Assign(_, value) = &statement.kind else {
+                    return None;
+                };
+                let ty = value.ty(body.locals()).ok()?;
+                matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(..)))
+                    .then(|| rustc_source_span(statement.span))
+            })
+            .collect::<Vec<_>>();
+        constructor_spans.sort_by_key(|span| {
+            (
+                span.start_line,
+                span.start_column,
+                span.end_line,
+                span.end_column,
+            )
+        });
+        constructor_spans.dedup();
+        let mut constructor_names = HashSet::new();
+        for local in body.locals() {
+            collect_adt_constructor_names(local.ty, &mut constructor_names);
+        }
+        let mut constructor_names = constructor_names.into_iter().collect::<Vec<_>>();
+        constructor_names.sort();
         raw_functions.push(RawSemanticFunction {
             key: normalize_instance_key(&instance_name),
             display: normalize_instance_display(&instance_name, &crate_name),
             body_span: rustc_source_span(body.span),
             calls,
+            constructor_spans,
+            constructor_names,
             parameter_types: body
                 .arg_locals()
                 .iter()
@@ -993,15 +1416,23 @@ fn collect_instance_bodies(
             }
 
             for block in &body.blocks {
-                let TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+                let TerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    ..
+                } = &block.terminator.kind
+                else {
                     continue;
                 };
                 let Some(target) = resolve_called_instance(&body, func) else {
                     continue;
                 };
                 if !matches!(target.kind, InstanceKind::Virtual { .. })
-                    && target.def.krate().is_local
                     && target.has_body()
+                    && (target.def.krate().is_local
+                        || instance_body_is_in_analysis_root(target)
+                        || call_boundary_contains_dyn(&body, args, destination))
                 {
                     queue.push_back(target);
                 }
@@ -1028,10 +1459,7 @@ fn collect_instance_bodies(
                     ) else {
                         continue;
                     };
-                    if candidate.def.krate().is_local
-                        && candidate.has_body()
-                        && !visited.contains(&candidate)
-                    {
+                    if candidate.has_body() && !visited.contains(&candidate) {
                         queue.push_back(candidate);
                     }
                 }
@@ -1042,6 +1470,30 @@ fn collect_instance_bodies(
         }
     }
     (bodies, observed_vtables)
+}
+
+fn instance_body_is_in_analysis_root(instance: Instance) -> bool {
+    let Some(root) = env::var_os(RUSTC_ANALYSIS_ROOT).map(PathBuf::from) else {
+        return false;
+    };
+    let Some(body) = instance.body() else {
+        return false;
+    };
+    let file = rustc_source_span(body.span).file;
+    file.starts_with(&root)
+        || file
+            .canonicalize()
+            .ok()
+            .zip(root.canonicalize().ok())
+            .is_some_and(|(file, root)| file.starts_with(root))
+}
+
+fn call_boundary_contains_dyn(body: &Body, arguments: &[Operand], destination: &Place) -> bool {
+    arguments
+        .iter()
+        .filter_map(|argument| argument.ty(body.locals()).ok())
+        .any(type_contains_dyn)
+        || destination.ty(body.locals()).is_ok_and(type_contains_dyn)
 }
 
 fn collect_observed_vtables(body: &rustc_public::mir::Body, observed: &mut Vec<TraitRef>) {
@@ -1141,7 +1593,11 @@ fn resolve_dispatch_candidate(
     .then_some(candidate)
 }
 
-type DynState = HashMap<Place, DynFlow>;
+#[derive(Clone, Default)]
+struct DynState {
+    flows: HashMap<Place, DynFlow>,
+    aliases: HashMap<Place, Vec<Place>>,
+}
 
 fn analyze_body_dyn_flows(
     body: &Body,
@@ -1156,10 +1612,12 @@ fn analyze_body_dyn_flows(
         return result;
     }
 
-    let mut entry = DynState::new();
+    let mut entry = DynState::default();
     for (index, argument) in body.arg_locals().iter().enumerate() {
         if type_contains_dyn(argument.ty) {
-            entry.insert(Place::from(index + 1), DynFlow::parameter(index));
+            entry
+                .flows
+                .insert(Place::from(index + 1), DynFlow::parameter(index));
         }
     }
     let mut incoming = vec![None::<DynState>; body.blocks.len()];
@@ -1207,18 +1665,36 @@ fn analyze_body_dyn_flows(
                 );
 
                 let destination_flow = resolve_called_instance(body, func).map_or_else(
-                    || unknown_if_dyn_place(body, destination),
+                    || unknown_if_dyn_place(body, destination, UnresolvedReason::ExternalCode),
                     |callee| {
                         if matches!(callee.kind, InstanceKind::Virtual { .. }) {
-                            unknown_if_dyn_place(body, destination)
+                            unknown_if_dyn_place(body, destination, UnresolvedReason::ExternalCode)
                         } else if let Some(summary) = return_summaries.get(&callee) {
-                            resolve_symbolic_flow(summary, &argument_flows)
+                            let mut flow = resolve_symbolic_flow(summary, &argument_flows);
+                            if !callee.def.krate().is_local {
+                                flow.merge(&external_return_flow(
+                                    body,
+                                    args,
+                                    destination,
+                                    &argument_flows,
+                                ));
+                            }
+                            flow
                         } else if local_instances.contains(&callee) {
                             DynFlow::default()
                         } else {
-                            unknown_if_dyn_place(body, destination)
+                            external_return_flow(body, args, destination, &argument_flows)
                         }
                     },
+                );
+
+                apply_external_memory_effects(
+                    body,
+                    &mut state,
+                    func,
+                    args,
+                    resolve_called_instance(body, func),
+                    &argument_flows,
                 );
 
                 for successor in block.terminator.successors() {
@@ -1247,9 +1723,90 @@ fn analyze_body_dyn_flows(
     result
 }
 
+fn external_return_flow(
+    body: &Body,
+    arguments: &[Operand],
+    destination: &Place,
+    argument_flows: &[DynFlow],
+) -> DynFlow {
+    if !destination.ty(body.locals()).is_ok_and(type_contains_dyn) {
+        return DynFlow::default();
+    }
+    let mut flow = DynFlow::unresolved(UnresolvedReason::ExternalCode);
+    for (argument, argument_flow) in arguments.iter().zip(argument_flows) {
+        if argument.ty(body.locals()).is_ok_and(type_contains_dyn) {
+            flow.merge(argument_flow);
+        }
+    }
+    flow
+}
+
+/// Model memory that crosses a call boundary as an abstract region attached
+/// to the referenced MIR place. This is type-directed: it does not name Vec,
+/// Arc, HashMap, or individual methods. Opaque external behavior remains in
+/// the unresolved-reason set, while concrete values that cross that same
+/// boundary remain available as partial evidence instead of being lost.
+fn apply_external_memory_effects(
+    body: &Body,
+    state: &mut DynState,
+    _function: &Operand,
+    arguments: &[Operand],
+    resolved: Option<Instance>,
+    argument_flows: &[DynFlow],
+) {
+    if resolved.is_some_and(|callee| callee.def.krate().is_local) {
+        return;
+    }
+    let mut stored = DynFlow::default();
+    for (argument, flow) in arguments.iter().zip(argument_flows) {
+        let Ok(ty) = argument.ty(body.locals()) else {
+            continue;
+        };
+        if !is_mutable_reference(ty) && type_contains_dyn(ty) {
+            stored.merge(flow);
+        }
+    }
+    if stored.is_empty() {
+        return;
+    }
+    stored
+        .unresolved_reasons
+        .insert(UnresolvedReason::ExternalCode);
+    for argument in arguments {
+        let Ok(ty) = argument.ty(body.locals()) else {
+            continue;
+        };
+        if !is_mutable_reference(ty) || !type_contains_dyn(ty) {
+            continue;
+        }
+        let Some(place) = operand_place(argument) else {
+            continue;
+        };
+        merge_dyn_place(state, place, &stored);
+    }
+}
+
+fn operand_place(operand: &Operand) -> Option<&Place> {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => Some(place),
+        Operand::Constant(_) | Operand::RuntimeChecks(_) => None,
+    }
+}
+
+fn is_mutable_reference(ty: Ty) -> bool {
+    matches!(
+        ty.kind(),
+        TyKind::RigidTy(RigidTy::Ref(_, _, rustc_public::mir::Mutability::Mut))
+            | TyKind::RigidTy(RigidTy::RawPtr(_, rustc_public::mir::Mutability::Mut))
+    )
+}
+
 fn degrade_dyn_analysis_to_unknown(body: &Body, analysis: &mut BodyDynAnalysis) {
     if type_contains_dyn(body.ret_local().ty) {
-        analysis.return_flow.unknown = true;
+        analysis
+            .return_flow
+            .unresolved_reasons
+            .insert(UnresolvedReason::AnalysisLimit);
     }
     for (block_index, block) in body.blocks.iter().enumerate() {
         let TerminatorKind::Call { args, .. } = &block.terminator.kind else {
@@ -1261,7 +1818,8 @@ fn degrade_dyn_analysis_to_unknown(body: &Body, analysis: &mut BodyDynAnalysis) 
         call.arguments.resize_with(args.len(), DynFlow::default);
         for (argument, flow) in args.iter().zip(&mut call.arguments) {
             if argument.ty(body.locals()).is_ok_and(type_contains_dyn) {
-                flow.unknown = true;
+                flow.unresolved_reasons
+                    .insert(UnresolvedReason::AnalysisLimit);
             }
         }
     }
@@ -1275,6 +1833,23 @@ fn transfer_dyn_statement(
     let StatementKind::Assign(destination, value) = &statement.kind else {
         return;
     };
+    match value {
+        Rvalue::Ref(_, _, source) | Rvalue::AddressOf(_, source) | Rvalue::CopyForDeref(source) => {
+            let targets = resolve_alias_places(state, source);
+            state.aliases.insert(destination.clone(), targets);
+        }
+        Rvalue::Use(Operand::Copy(source) | Operand::Move(source), _)
+        | Rvalue::Cast(_, Operand::Copy(source) | Operand::Move(source), _) => {
+            if let Some(targets) = state.aliases.get(source).cloned() {
+                state.aliases.insert(destination.clone(), targets);
+            } else {
+                state.aliases.remove(destination);
+            }
+        }
+        _ => {
+            state.aliases.remove(destination);
+        }
+    }
     let flow = dyn_flow_for_rvalue(body, state, value);
     write_dyn_place(state, destination, flow);
 
@@ -1347,7 +1922,8 @@ fn dyn_flow_for_rvalue(body: &Body, state: &DynState, value: &Rvalue) -> DynFlow
         Rvalue::ThreadLocalRef(_) | Rvalue::Discriminant(_) | Rvalue::Len(_) => DynFlow::default(),
     };
     if flow.is_empty() && value.ty(body.locals()).is_ok_and(type_contains_dyn) {
-        flow.unknown = true;
+        flow.unresolved_reasons
+            .insert(UnresolvedReason::AnalysisLimit);
     }
     flow
 }
@@ -1358,30 +1934,93 @@ fn dyn_flow_for_operand(body: &Body, state: &DynState, operand: &Operand) -> Dyn
         Operand::Constant(_) | Operand::RuntimeChecks(_) => DynFlow::default(),
     };
     if flow.is_empty() && operand.ty(body.locals()).is_ok_and(type_contains_dyn) {
-        flow.unknown = true;
+        flow.unresolved_reasons
+            .insert(UnresolvedReason::ExternalMemory);
     }
     flow
 }
 
-fn unknown_if_dyn_place(body: &Body, place: &Place) -> DynFlow {
+fn unknown_if_dyn_place(body: &Body, place: &Place, reason: UnresolvedReason) -> DynFlow {
     place
         .ty(body.locals())
         .ok()
         .filter(|ty| type_contains_dyn(*ty))
-        .map_or_else(DynFlow::default, |_| DynFlow::unknown())
+        .map_or_else(DynFlow::default, |_| DynFlow::unresolved(reason))
 }
 
 fn type_contains_dyn(ty: Ty) -> bool {
     ty.to_string().contains("dyn ")
 }
 
+fn collect_adt_constructor_names(ty: Ty, names: &mut HashSet<String>) {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Adt(definition, arguments)) => {
+            names.extend(
+                definition
+                    .variants()
+                    .into_iter()
+                    .map(|variant| variant.name().to_string()),
+            );
+            for argument in arguments.0 {
+                if let Some(ty) = argument.ty() {
+                    collect_adt_constructor_names(*ty, names);
+                }
+            }
+        }
+        TyKind::RigidTy(
+            RigidTy::FnDef(_, arguments)
+            | RigidTy::Closure(_, arguments)
+            | RigidTy::Coroutine(_, arguments)
+            | RigidTy::CoroutineClosure(_, arguments)
+            | RigidTy::CoroutineWitness(_, arguments),
+        ) => {
+            for argument in arguments.0 {
+                if let Some(ty) = argument.ty() {
+                    collect_adt_constructor_names(*ty, names);
+                }
+            }
+        }
+        TyKind::RigidTy(
+            RigidTy::Array(ty, _)
+            | RigidTy::Slice(ty)
+            | RigidTy::RawPtr(ty, _)
+            | RigidTy::Ref(_, ty, _),
+        ) => collect_adt_constructor_names(ty, names),
+        TyKind::RigidTy(RigidTy::Tuple(types)) => {
+            for ty in types {
+                collect_adt_constructor_names(ty, names);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn read_dyn_place(state: &DynState, place: &Place) -> DynFlow {
-    if let Some(flow) = state.get(place) {
+    if let Some(flow) = state.flows.get(place) {
+        return flow.clone();
+    }
+    let alias_targets = resolve_alias_places(state, place);
+    if alias_targets.len() != 1 || alias_targets.first() != Some(place) {
+        let mut aliased = DynFlow::default();
+        for target in alias_targets {
+            if target != *place {
+                aliased.merge(&read_dyn_place_without_alias(state, &target));
+            }
+        }
+        if !aliased.is_empty() {
+            return aliased;
+        }
+    }
+    read_dyn_place_without_alias(state, place)
+}
+
+fn read_dyn_place_without_alias(state: &DynState, place: &Place) -> DynFlow {
+    if let Some(flow) = state.flows.get(place) {
         return flow.clone();
     }
     let mut ancestor = place.clone();
     while ancestor.projection.pop().is_some() {
-        if let Some(flow) = state.get(&ancestor) {
+        if let Some(flow) = state.flows.get(&ancestor) {
             let suffix = &place.projection[ancestor.projection.len()..];
             return if suffix
                 .iter()
@@ -1389,15 +2028,21 @@ fn read_dyn_place(state: &DynState, place: &Place) -> DynFlow {
             {
                 flow.clone()
             } else {
-                // Whole-value flow is not enough to assign a candidate to one
-                // particular field. Keep this unresolved instead of leaking
-                // candidates from sibling fields.
-                DynFlow::unknown()
+                // Locally built aggregates have explicit field entries above.
+                // A whole-value-only region came from opaque memory (for
+                // example an allocator-backed container), so retain its
+                // candidates but mark the projection as partial rather than
+                // assigning them as exact field provenance.
+                let mut projected = flow.clone();
+                projected
+                    .unresolved_reasons
+                    .insert(UnresolvedReason::ExternalMemory);
+                projected
             };
         }
     }
     let mut result = DynFlow::default();
-    for (candidate, flow) in state {
+    for (candidate, flow) in &state.flows {
         if place_is_prefix(place, candidate) {
             result.merge(flow);
         }
@@ -1406,10 +2051,55 @@ fn read_dyn_place(state: &DynState, place: &Place) -> DynFlow {
 }
 
 fn write_dyn_place(state: &mut DynState, place: &Place, flow: DynFlow) {
-    state.retain(|candidate, _| !place_is_prefix(place, candidate));
-    if !flow.is_empty() {
-        state.insert(place.clone(), flow);
+    let targets = resolve_alias_places(state, place);
+    let targets = if targets.len() == 1 && targets[0] == *place {
+        vec![place.clone()]
+    } else {
+        targets
+    };
+    for target in targets {
+        state
+            .flows
+            .retain(|candidate, _| !place_is_prefix(&target, candidate));
+        if !flow.is_empty() {
+            state.flows.insert(target, flow.clone());
+        }
     }
+}
+
+fn merge_dyn_place(state: &mut DynState, place: &Place, flow: &DynFlow) {
+    if flow.is_empty() {
+        return;
+    }
+    let targets = resolve_alias_places(state, place);
+    for target in targets {
+        state.flows.entry(target).or_default().merge(flow);
+    }
+}
+
+fn resolve_alias_places(state: &DynState, place: &Place) -> Vec<Place> {
+    if let Some(targets) = state.aliases.get(place) {
+        return targets.clone();
+    }
+    let base = Place::from(place.local);
+    let Some(targets) = state.aliases.get(&base) else {
+        return vec![place.clone()];
+    };
+    let mut suffix = place.projection.as_slice();
+    if suffix
+        .first()
+        .is_some_and(|projection| matches!(projection, ProjectionElem::Deref))
+    {
+        suffix = &suffix[1..];
+    }
+    targets
+        .iter()
+        .cloned()
+        .map(|mut target| {
+            target.projection.extend_from_slice(suffix);
+            target
+        })
+        .collect()
 }
 
 fn place_is_prefix(prefix: &Place, place: &Place) -> bool {
@@ -1424,8 +2114,21 @@ fn merge_dyn_state(destination: &mut Option<DynState>, source: &DynState) -> boo
         return true;
     };
     let mut changed = false;
-    for (place, flow) in source {
-        changed |= destination.entry(place.clone()).or_default().merge(flow);
+    for (place, flow) in &source.flows {
+        changed |= destination
+            .flows
+            .entry(place.clone())
+            .or_default()
+            .merge(flow);
+    }
+    for (place, targets) in &source.aliases {
+        let destination_targets = destination.aliases.entry(place.clone()).or_default();
+        for target in targets {
+            if !destination_targets.contains(target) {
+                destination_targets.push(target.clone());
+                changed = true;
+            }
+        }
     }
     changed
 }
@@ -1449,13 +2152,15 @@ fn resolve_symbolic_flow(flow: &DynFlow, arguments: &[DynFlow]) -> DynFlow {
     let mut resolved = DynFlow {
         concrete: flow.concrete.clone(),
         parameters: Vec::new(),
-        unknown: flow.unknown,
+        unresolved_reasons: flow.unresolved_reasons.clone(),
     };
     for parameter in &flow.parameters {
         if let Some(argument) = arguments.get(*parameter) {
             resolved.merge(argument);
         } else {
-            resolved.unknown = true;
+            resolved
+                .unresolved_reasons
+                .insert(UnresolvedReason::AnalysisLimit);
         }
     }
     resolved
@@ -1496,6 +2201,7 @@ fn specialize_semantic_functions(
                         }
                     }
                 }
+                RawSemanticCallTarget::Indirect { .. } | RawSemanticCallTarget::Unresolved => {}
             }
         }
     }
@@ -1514,10 +2220,14 @@ fn specialize_semantic_functions(
         while let Some((raw_index, context)) = pending.pop_front() {
             let raw = &raw_functions[raw_index];
             let function_key = specialized_function_key(raw, &context);
+            // Multiple compiler instances can normalize to the same display
+            // key. Even when the emitted semantic function was already seen,
+            // this raw instance is consumed; otherwise the disconnected-root
+            // fallback below selects it forever.
+            covered_raw.insert(raw_index);
             if !visited.insert(function_key.clone()) {
                 continue;
             }
-            covered_raw.insert(raw_index);
             let mut calls = Vec::new();
 
             for raw_call in &raw.calls {
@@ -1545,6 +2255,7 @@ fn specialize_semantic_functions(
                         display,
                         receiver,
                     } => {
+                        let receiver_flow = semantic_dyn_flow(receiver, crate_name);
                         let receiver = resolve_context_flow(receiver, &context);
                         let mut candidates = Vec::new();
                         for trait_ref in &receiver.concrete {
@@ -1594,23 +2305,37 @@ fn specialize_semantic_functions(
                             key: key.clone(),
                             display: display.clone(),
                             candidates,
-                            open: receiver.unknown,
+                            open: !receiver.unresolved_reasons.is_empty(),
+                            unresolved_reasons: receiver.unresolved_reasons,
+                            receiver_flow,
                         }
                     }
+                    RawSemanticCallTarget::Indirect { signature } => SemanticCallTarget::Indirect {
+                        signature: signature.clone(),
+                    },
+                    RawSemanticCallTarget::Unresolved => SemanticCallTarget::Unresolved,
                 };
                 calls.push(SemanticCall {
                     target,
                     definition_name: raw_call.definition_name.clone(),
                     span: raw_call.span.clone(),
                     argument_types: raw_call.argument_types.clone(),
+                    argument_flows: raw_call
+                        .argument_flows
+                        .iter()
+                        .map(|flow| semantic_dyn_flow(flow, crate_name))
+                        .collect(),
                 });
             }
 
             functions.push(SemanticFunction {
+                base_key: raw.key.clone(),
                 key: function_key,
                 display: raw.display.clone(),
                 body_span: raw.body_span.clone(),
                 calls,
+                constructor_spans: raw.constructor_spans.clone(),
+                constructor_names: raw.constructor_names.clone(),
                 parameter_types: raw.parameter_types.clone(),
             });
         }
@@ -1630,7 +2355,11 @@ fn root_dyn_context(function: &RawSemanticFunction) -> Vec<ResolvedDynFlow> {
         .iter()
         .map(|parameter| ResolvedDynFlow {
             concrete: Vec::new(),
-            unknown: parameter.contains("dyn "),
+            unresolved_reasons: parameter
+                .contains("dyn ")
+                .then_some(UnresolvedReason::OpaqueInput)
+                .into_iter()
+                .collect(),
         })
         .collect()
 }
@@ -1651,12 +2380,14 @@ fn call_dyn_context(
             arguments.get(index).map_or_else(
                 || ResolvedDynFlow {
                     concrete: Vec::new(),
-                    unknown: true,
+                    unresolved_reasons: [UnresolvedReason::AnalysisLimit].into_iter().collect(),
                 },
                 |flow| {
                     let mut resolved = resolve_context_flow(flow, caller_context);
-                    if resolved.concrete.is_empty() && !resolved.unknown {
-                        resolved.unknown = true;
+                    if resolved.concrete.is_empty() && resolved.unresolved_reasons.is_empty() {
+                        resolved
+                            .unresolved_reasons
+                            .insert(UnresolvedReason::AnalysisLimit);
                     }
                     resolved
                 },
@@ -1668,16 +2399,33 @@ fn call_dyn_context(
 fn resolve_context_flow(flow: &DynFlow, context: &[ResolvedDynFlow]) -> ResolvedDynFlow {
     let mut resolved = ResolvedDynFlow {
         concrete: flow.concrete.clone(),
-        unknown: flow.unknown,
+        unresolved_reasons: flow.unresolved_reasons.clone(),
     };
     for parameter in &flow.parameters {
         if let Some(argument) = context.get(*parameter) {
             resolved.merge(argument);
         } else {
-            resolved.unknown = true;
+            resolved
+                .unresolved_reasons
+                .insert(UnresolvedReason::AnalysisLimit);
         }
     }
     resolved
+}
+
+fn semantic_dyn_flow(flow: &DynFlow, crate_name: &str) -> SemanticDynFlow {
+    let mut concrete_types = flow
+        .concrete
+        .iter()
+        .map(|trait_ref| normalize_type_display(&trait_ref.self_ty().to_string(), crate_name))
+        .collect::<Vec<_>>();
+    concrete_types.sort();
+    concrete_types.dedup();
+    SemanticDynFlow {
+        concrete_types,
+        parameters: flow.parameters.clone(),
+        unresolved_reasons: flow.unresolved_reasons.clone(),
+    }
 }
 
 fn specialized_function_key(function: &RawSemanticFunction, context: &[ResolvedDynFlow]) -> String {
@@ -1690,7 +2438,7 @@ fn specialized_function_key(function: &RawSemanticFunction, context: &[ResolvedD
                 .get(*index)
                 .is_some_and(|parameter| parameter.contains("dyn "))
                 || !value.concrete.is_empty()
-                || value.unknown
+                || !value.unresolved_reasons.is_empty()
         })
         .map(|(index, value)| {
             let mut candidates = value
@@ -1699,8 +2447,8 @@ fn specialized_function_key(function: &RawSemanticFunction, context: &[ResolvedD
                 .map(|trait_ref| trait_ref.self_ty().to_string())
                 .collect::<Vec<_>>();
             candidates.sort();
-            if value.unknown {
-                candidates.push("?".to_owned());
+            for reason in &value.unresolved_reasons {
+                candidates.push(format!("?{reason}"));
             }
             format!("{index}={}", candidates.join("|"))
         })
@@ -1712,71 +2460,457 @@ fn specialized_function_key(function: &RawSemanticFunction, context: &[ResolvedD
     }
 }
 
-fn merge_semantic_program(syntax: FileAnalysis, semantic: SemanticProgram) -> FileAnalysis {
-    let mut analysis = FileAnalysis::default();
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NamedDynFlow {
+    concrete_types: BTreeSet<String>,
+    unresolved_reasons: BTreeSet<UnresolvedReason>,
+}
+
+fn respecialize_merged_semantic_program(program: &mut SemanticProgram) {
+    if program.functions.is_empty() {
+        return;
+    }
+    let mut templates = BTreeMap::<String, SemanticFunction>::new();
+    for function in &program.functions {
+        templates
+            .entry(function.base_key.clone())
+            .and_modify(|existing| {
+                if semantic_template_score(function) > semantic_template_score(existing) {
+                    *existing = function.clone();
+                }
+            })
+            .or_insert_with(|| function.clone());
+    }
+    let bases = templates.keys().cloned().collect::<HashSet<_>>();
+    let mut incoming = bases
+        .iter()
+        .cloned()
+        .map(|key| (key, 0usize))
+        .collect::<HashMap<_, _>>();
+    for function in templates.values() {
+        for call in &function.calls {
+            let SemanticCallTarget::Direct { key, .. } = &call.target else {
+                continue;
+            };
+            if let Some(base) = semantic_target_base(key, &bases) {
+                *incoming.entry(base).or_default() += 1;
+            }
+        }
+    }
+
+    let mut pending = incoming
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .filter_map(|(base, _)| {
+            templates
+                .get(base)
+                .map(|function| (base.clone(), root_named_context(function)))
+        })
+        .collect::<VecDeque<_>>();
+    let mut visited = HashSet::new();
+    let mut covered = HashSet::new();
+    let mut specialized = Vec::new();
+
+    loop {
+        while let Some((base, context)) = pending.pop_front() {
+            let Some(template) = templates.get(&base) else {
+                continue;
+            };
+            covered.insert(base.clone());
+            let key = named_specialized_key(template, &context);
+            if !visited.insert(key.clone()) {
+                continue;
+            }
+            let mut function = template.clone();
+            function.key = key;
+            for call in &mut function.calls {
+                match &mut call.target {
+                    SemanticCallTarget::Direct { key, .. } => {
+                        let Some(target_base) = semantic_target_base(key, &bases) else {
+                            continue;
+                        };
+                        let Some(target) = templates.get(&target_base) else {
+                            continue;
+                        };
+                        let target_context =
+                            named_call_context(target, &call.argument_flows, &context);
+                        *key = named_specialized_key(target, &target_context);
+                        pending.push_back((target_base, target_context));
+                    }
+                    SemanticCallTarget::Dynamic {
+                        key,
+                        candidates,
+                        open,
+                        unresolved_reasons,
+                        receiver_flow,
+                        ..
+                    } => {
+                        let mut receiver = resolve_named_flow(receiver_flow, &context);
+                        if let Some(argument_receiver) = call.argument_flows.first() {
+                            merge_named_flow(
+                                &mut receiver,
+                                &resolve_named_flow(argument_receiver, &context),
+                            );
+                        }
+                        *candidates = receiver
+                            .concrete_types
+                            .iter()
+                            .filter_map(|concrete| {
+                                let candidate =
+                                    named_dispatch_candidate(concrete, key, templates.values())?;
+                                let candidate_context =
+                                    named_call_context(candidate, &call.argument_flows, &context);
+                                let candidate_key =
+                                    named_specialized_key(candidate, &candidate_context);
+                                pending.push_back((candidate.base_key.clone(), candidate_context));
+                                Some(SemanticDispatchCandidate {
+                                    key: candidate_key,
+                                    display: candidate.display.clone(),
+                                })
+                            })
+                            .collect();
+                        candidates.sort_by(|left, right| left.key.cmp(&right.key));
+                        candidates.dedup_by(|left, right| left.key == right.key);
+                        *unresolved_reasons = receiver.unresolved_reasons;
+                        *open = !unresolved_reasons.is_empty();
+                    }
+                    SemanticCallTarget::Indirect { .. } | SemanticCallTarget::Unresolved => {}
+                }
+            }
+            specialized.push(function);
+        }
+
+        let Some(uncovered) = templates
+            .keys()
+            .find(|base| !covered.contains(*base))
+            .cloned()
+        else {
+            break;
+        };
+        let context = root_named_context(&templates[&uncovered]);
+        pending.push_back((uncovered, context));
+    }
+    specialized.sort_by(|left, right| left.key.cmp(&right.key));
+    program.functions = specialized;
+}
+
+fn merge_named_flow(destination: &mut NamedDynFlow, source: &NamedDynFlow) {
+    destination
+        .concrete_types
+        .extend(source.concrete_types.iter().cloned());
+    destination
+        .unresolved_reasons
+        .extend(source.unresolved_reasons.iter().cloned());
+}
+
+fn semantic_template_score(function: &SemanticFunction) -> usize {
+    let symbolic = function
+        .calls
+        .iter()
+        .map(|call| {
+            let arguments = call
+                .argument_flows
+                .iter()
+                .map(|flow| flow.parameters.len())
+                .sum::<usize>();
+            let receiver = match &call.target {
+                SemanticCallTarget::Dynamic { receiver_flow, .. } => receiver_flow.parameters.len(),
+                _ => 0,
+            };
+            arguments + receiver
+        })
+        .sum::<usize>();
+    let exact_base = usize::from(function.key == function.base_key);
+    symbolic.saturating_mul(10) + exact_base
+}
+
+fn semantic_target_base(key: &str, bases: &HashSet<String>) -> Option<String> {
+    if bases.contains(key) {
+        return Some(key.to_owned());
+    }
+    bases
+        .iter()
+        .filter(|base| key.starts_with(base.as_str()))
+        .max_by_key(|base| base.len())
+        .cloned()
+}
+
+fn root_named_context(function: &SemanticFunction) -> Vec<NamedDynFlow> {
+    function
+        .parameter_types
+        .iter()
+        .map(|parameter| NamedDynFlow {
+            concrete_types: BTreeSet::new(),
+            unresolved_reasons: parameter
+                .contains("dyn ")
+                .then_some(UnresolvedReason::OpaqueInput)
+                .into_iter()
+                .collect(),
+        })
+        .collect()
+}
+
+fn named_call_context(
+    callee: &SemanticFunction,
+    arguments: &[SemanticDynFlow],
+    caller_context: &[NamedDynFlow],
+) -> Vec<NamedDynFlow> {
+    callee
+        .parameter_types
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| {
+            if !parameter.contains("dyn ") {
+                return NamedDynFlow::default();
+            }
+            arguments.get(index).map_or_else(
+                || NamedDynFlow {
+                    concrete_types: BTreeSet::new(),
+                    unresolved_reasons: [UnresolvedReason::AnalysisLimit].into_iter().collect(),
+                },
+                |flow| resolve_named_flow(flow, caller_context),
+            )
+        })
+        .collect()
+}
+
+fn resolve_named_flow(flow: &SemanticDynFlow, context: &[NamedDynFlow]) -> NamedDynFlow {
+    let mut resolved = NamedDynFlow {
+        concrete_types: flow.concrete_types.iter().cloned().collect(),
+        unresolved_reasons: flow.unresolved_reasons.clone(),
+    };
+    for parameter in &flow.parameters {
+        if let Some(value) = context.get(*parameter) {
+            resolved
+                .concrete_types
+                .extend(value.concrete_types.iter().cloned());
+            resolved
+                .unresolved_reasons
+                .extend(value.unresolved_reasons.iter().cloned());
+        } else {
+            resolved
+                .unresolved_reasons
+                .insert(UnresolvedReason::AnalysisLimit);
+        }
+    }
+    resolved
+}
+
+fn named_specialized_key(function: &SemanticFunction, context: &[NamedDynFlow]) -> String {
+    let bindings = context
+        .iter()
+        .enumerate()
+        .filter(|(index, flow)| {
+            function
+                .parameter_types
+                .get(*index)
+                .is_some_and(|parameter| parameter.contains("dyn "))
+                || !flow.concrete_types.is_empty()
+                || !flow.unresolved_reasons.is_empty()
+        })
+        .map(|(index, flow)| {
+            let mut values = flow.concrete_types.iter().cloned().collect::<Vec<_>>();
+            values.extend(
+                flow.unresolved_reasons
+                    .iter()
+                    .map(|reason| format!("?{reason}")),
+            );
+            format!("{index}={}", values.join("|"))
+        })
+        .collect::<Vec<_>>();
+    if bindings.is_empty() {
+        function.base_key.clone()
+    } else {
+        format!("{}#ctx[dyn:{}]", function.base_key, bindings.join(","))
+    }
+}
+
+fn named_dispatch_candidate<'a>(
+    concrete: &str,
+    dispatch: &str,
+    functions: impl Iterator<Item = &'a SemanticFunction>,
+) -> Option<&'a SemanticFunction> {
+    let method = dispatch
+        .rsplit("::")
+        .next()
+        .unwrap_or(dispatch)
+        .trim_end_matches('>');
+    let concrete = concrete
+        .rsplit("::")
+        .next()
+        .unwrap_or(concrete)
+        .trim_matches(['&', ' ', '<', '>']);
+    functions
+        .filter(|function| {
+            function.display.ends_with(&format!("{concrete}::{method}"))
+                || (function.display.ends_with(&format!("::{method}"))
+                    && function.base_key.contains(concrete)
+                    && function.base_key.contains(" as "))
+        })
+        .min_by_key(|function| function.base_key.clone())
+}
+
+fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -> FileAnalysis {
+    let mut analysis = FileAnalysis {
+        source_files: syntax.source_files.clone(),
+        ..FileAnalysis::default()
+    };
+    let file_identities = source_file_identities(&syntax, &semantic);
+    canonicalize_semantic_closures(&syntax, &mut semantic, &file_identities);
+    let local_function_keys = semantic
+        .functions
+        .iter()
+        .map(|function| function.key.clone())
+        .collect::<HashSet<_>>();
+    let semantic_closure_keys = semantic_closure_keys(&syntax, &semantic, &file_identities);
+    let mut required_syntax_closures = HashSet::<SymbolId>::new();
+    let mut matched_syntax_functions = HashSet::<SymbolId>::new();
+    let generic_syntax_functions = syntax
+        .facts
+        .iter()
+        .filter(|fact| fact.kind == "generic-parameter")
+        .map(|fact| fact.subject.clone())
+        .collect::<HashSet<_>>();
+    let mut syntax_functions_by_file = HashMap::<PathBuf, Vec<usize>>::new();
+    for (index, function) in syntax.functions.iter().enumerate() {
+        syntax_functions_by_file
+            .entry(source_file_identity(&file_identities, &function.span.file).to_path_buf())
+            .or_default()
+            .push(index);
+    }
+    let mut facts_by_subject = HashMap::<&SymbolId, Vec<&LanguageFact>>::new();
+    for fact in &syntax.facts {
+        facts_by_subject
+            .entry(&fact.subject)
+            .or_default()
+            .push(fact);
+    }
 
     for semantic_function in semantic.functions {
-        let Some(template) =
-            best_function_template(&syntax.functions, &semantic_function.body_span)
-        else {
+        let function_file =
+            source_file_identity(&file_identities, &semantic_function.body_span.file);
+        let Some(candidate_indices) = syntax_functions_by_file.get(function_file) else {
+            continue;
+        };
+        let Some(template) = best_function_template(
+            &syntax.functions,
+            candidate_indices,
+            &semantic_function.body_span,
+        ) else {
             // Compiler-generated functions (drop glue, coroutine shims, etc.)
             // are intentionally omitted until they have explicit source syntax.
             continue;
         };
+        matched_syntax_functions.insert(template.id.clone());
         let id = semantic_symbol(semantic_function.key);
         let mut claimed_calls = HashSet::new();
         let calls = template
             .calls
             .iter()
-            .map(|call| {
-                let match_index =
-                    best_semantic_call(call, &semantic_function.calls, &claimed_calls);
-                let mut resolved = call.clone();
-                if let Some(index) = match_index {
-                    claimed_calls.insert(index);
-                    let semantic_call = &semantic_function.calls[index];
-                    match &semantic_call.target {
-                        SemanticCallTarget::Direct { key, display } => {
-                            resolved.target = CallTarget::Direct(semantic_symbol(key.clone()));
-                            resolved.label = replace_label_callee(&resolved.label, display);
-                        }
-                        SemanticCallTarget::Dynamic {
-                            key,
-                            display,
-                            candidates,
-                            open,
-                            ..
-                        } => {
-                            resolved.target = CallTarget::Dynamic {
-                                dispatch: semantic_symbol(key.clone()),
-                                candidates: candidates
-                                    .iter()
-                                    .map(|candidate| DispatchCandidate {
-                                        target: semantic_symbol(candidate.key.clone()),
-                                        label: replace_label_callee(
-                                            &resolved.label,
-                                            &candidate.display,
-                                        ),
-                                    })
-                                    .collect(),
-                                resolution: if candidates.is_empty() {
-                                    DispatchResolution::Unresolved
-                                } else if *open {
-                                    DispatchResolution::Partial
-                                } else {
-                                    DispatchResolution::Complete
+            .filter_map(|call| {
+                let Some(match_index) = best_semantic_call(
+                    call,
+                    &semantic_function.calls,
+                    &claimed_calls,
+                    &file_identities,
+                ) else {
+                    let is_constructor = semantic_function
+                        .constructor_spans
+                        .iter()
+                        .any(|span| span_coordinates_equal(&call.span, span))
+                        || call_syntax_name(call).is_some_and(|name| {
+                            semantic_function
+                                .constructor_names
+                                .iter()
+                                .any(|constructor| constructor == name)
+                        });
+                    if is_constructor {
+                        return None;
+                    }
+                    let mut unresolved = call.clone();
+                    if let Some(closure) =
+                        source_closure_for_call(template, call, &syntax.functions)
+                    {
+                        unresolved.target = semantic_closure_keys
+                            .get(&closure.id)
+                            .cloned()
+                            .map(semantic_symbol)
+                            .map_or_else(
+                                || {
+                                    required_syntax_closures.insert(closure.id.clone());
+                                    CallTarget::Direct(closure.id.clone())
                                 },
-                            };
+                                CallTarget::Direct,
+                            );
+                        unresolved.label =
+                            replace_label_callee(&unresolved.label, closure_label_callee(closure));
+                    }
+                    return Some(unresolved);
+                };
+                let mut resolved = call.clone();
+                claimed_calls.insert(match_index);
+                let semantic_call = &semantic_function.calls[match_index];
+                match &semantic_call.target {
+                    SemanticCallTarget::Direct { key, display } => {
+                        resolved.target = CallTarget::Direct(semantic_symbol(key.clone()));
+                        if local_function_keys.contains(key) {
                             resolved.label = replace_label_callee(&resolved.label, display);
                         }
                     }
-                    let argument_types = semantic_call_argument_types(semantic_call);
-                    resolved.label.typed = Some(annotate_rust_label(
-                        &resolved.label.default,
-                        &argument_types,
-                    ));
+                    SemanticCallTarget::Dynamic {
+                        key,
+                        display,
+                        candidates,
+                        open,
+                        unresolved_reasons,
+                        ..
+                    } => {
+                        resolved.target = CallTarget::Dynamic {
+                            dispatch: semantic_symbol(key.clone()),
+                            candidates: candidates
+                                .iter()
+                                .map(|candidate| DispatchCandidate {
+                                    target: semantic_symbol(candidate.key.clone()),
+                                    label: replace_label_callee(
+                                        &resolved.label,
+                                        &candidate.display,
+                                    ),
+                                })
+                                .collect(),
+                            resolution: if candidates.is_empty() {
+                                DispatchResolution::Unresolved
+                            } else if *open {
+                                DispatchResolution::Partial
+                            } else {
+                                DispatchResolution::Complete
+                            },
+                            evidence: DispatchEvidence::ExactFlow,
+                            unresolved_reasons: if unresolved_reasons.is_empty()
+                                && candidates.is_empty()
+                            {
+                                [UnresolvedReason::AnalysisLimit].into_iter().collect()
+                            } else {
+                                unresolved_reasons.clone()
+                            },
+                        };
+                        resolved.label = replace_label_callee(&resolved.label, display);
+                    }
+                    SemanticCallTarget::Indirect { signature } => {
+                        resolved.target = CallTarget::Indirect {
+                            signature: Some(signature.clone()),
+                            reason: UnresolvedReason::FunctionPointer,
+                        };
+                    }
+                    SemanticCallTarget::Unresolved => {
+                        resolved.target = CallTarget::Unresolved;
+                    }
                 }
-                resolved
+                let argument_types = semantic_call_argument_types(semantic_call);
+                resolved.label.typed = Some(annotate_rust_label(
+                    &resolved.label.default,
+                    &argument_types,
+                ));
+                Some(resolved)
             })
             .collect();
 
@@ -1792,32 +2926,539 @@ fn merge_semantic_program(syntax: FileAnalysis, semantic: SemanticProgram) -> Fi
             calls,
             span: template.span.clone(),
         });
-        analysis.facts.extend(
-            syntax
-                .facts
-                .iter()
-                .filter(|fact| fact.subject == template.id)
-                .cloned()
-                .map(|mut fact| {
-                    fact.subject = id.clone();
-                    fact
-                }),
-        );
+        if let Some(facts) = facts_by_subject.get(&template.id) {
+            analysis.facts.extend(facts.iter().map(|fact| {
+                let mut fact = (*fact).clone();
+                fact.subject = id.clone();
+                fact
+            }));
+        }
     }
+
+    for function in &syntax.functions {
+        let preserve_closure = required_syntax_closures.contains(&function.id);
+        let preserve_open_generic = generic_syntax_functions.contains(&function.id)
+            && !matched_syntax_functions.contains(&function.id);
+        if !preserve_closure && !preserve_open_generic {
+            continue;
+        }
+        analysis.functions.push(function.clone());
+        if preserve_open_generic && let Some(facts) = facts_by_subject.get(&function.id) {
+            analysis.facts.extend(facts.iter().copied().cloned());
+        }
+    }
+
+    synthesize_referenced_generic_instances(&mut analysis, &syntax);
 
     analysis
 }
 
+fn synthesize_referenced_generic_instances(analysis: &mut FileAnalysis, syntax: &FileAnalysis) {
+    let generic_parameters = syntax
+        .facts
+        .iter()
+        .filter(|fact| fact.kind == "generic-parameter")
+        .fold(BTreeMap::<SymbolId, Vec<String>>::new(), |mut map, fact| {
+            map.entry(fact.subject.clone())
+                .or_default()
+                .push(fact.key.clone());
+            map
+        });
+    if generic_parameters.is_empty() {
+        return;
+    }
+
+    let mut used_templates = HashSet::new();
+    loop {
+        let known = analysis
+            .functions
+            .iter()
+            .map(|function| function.id.clone())
+            .collect::<HashSet<_>>();
+        let missing = analysis
+            .functions
+            .iter()
+            .flat_map(|function| &function.calls)
+            .filter_map(|call| match &call.target {
+                CallTarget::Direct(target)
+                    if !known.contains(target) && target.language.0 == "rust" =>
+                {
+                    Some(target.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut added = Vec::new();
+        for target in missing {
+            let Some((base, arguments)) = generic_instance_parts(&target.name) else {
+                continue;
+            };
+            let Some(template) = syntax.functions.iter().find(|function| {
+                function.id.name == base
+                    && generic_parameters
+                        .get(&function.id)
+                        .is_some_and(|parameters| parameters.len() == arguments.len())
+            }) else {
+                continue;
+            };
+            let parameters = &generic_parameters[&template.id];
+            let bindings = parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            let mut function = template.clone();
+            function.id = target.clone();
+            let display = normalize_instance_display(&target.name, "");
+            function.label = replace_label_callee(&function.label, &display);
+            for call in &mut function.calls {
+                substitute_generic_call(call, &bindings, &analysis.functions);
+            }
+            used_templates.insert(template.id.clone());
+            added.push(function);
+        }
+        if added.is_empty() {
+            break;
+        }
+        analysis.functions.extend(added);
+    }
+
+    let displays = analysis
+        .functions
+        .iter()
+        .map(|function| {
+            (
+                function.id.clone(),
+                outer_call_arguments_start(&function.label.default)
+                    .map_or(function.label.default.clone(), |start| {
+                        function.label.default[..start].to_owned()
+                    }),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for function in &mut analysis.functions {
+        for call in &mut function.calls {
+            let CallTarget::Direct(target) = &call.target else {
+                continue;
+            };
+            if let Some(display) = displays.get(target) {
+                call.label = replace_label_callee(&call.label, display);
+            }
+        }
+    }
+    analysis
+        .functions
+        .retain(|function| !used_templates.contains(&function.id));
+    analysis
+        .facts
+        .retain(|fact| !used_templates.contains(&fact.subject));
+}
+
+fn generic_instance_parts(instance: &str) -> Option<(String, Vec<String>)> {
+    let start = instance.find('<')?;
+    let end = instance.rfind('>')?;
+    if end <= start {
+        return None;
+    }
+    let base = instance[..start]
+        .rsplit("::")
+        .next()
+        .unwrap_or(&instance[..start])
+        .to_owned();
+    let arguments = split_rust_arguments(&instance[start + 1..end])
+        .into_iter()
+        .map(simplify_type_paths)
+        .collect();
+    Some((base, arguments))
+}
+
+fn substitute_generic_call(
+    call: &mut CallSite,
+    bindings: &HashMap<String, String>,
+    functions: &[FunctionInfo],
+) {
+    let CallTarget::Direct(target) = &call.target else {
+        return;
+    };
+    let Some(container) = target.container.as_deref() else {
+        return;
+    };
+    let parameter = container
+        .split_once(" as ")
+        .map_or(container, |(parameter, _)| parameter);
+    let Some(concrete) = bindings.get(parameter) else {
+        return;
+    };
+    let callee = format!("{concrete}::{}", target.name);
+    call.label = replace_label_callee(&call.label, &callee);
+    call.target = functions
+        .iter()
+        .find(|function| {
+            outer_call_arguments_start(&function.label.default)
+                .is_some_and(|start| function.label.default[..start] == callee)
+        })
+        .map(|function| function.id.clone())
+        .map_or_else(
+            || {
+                CallTarget::Direct(SymbolId {
+                    language: LanguageId::new("rust"),
+                    module: target.module.clone(),
+                    container: Some(concrete.clone()),
+                    name: target.name.clone(),
+                })
+            },
+            CallTarget::Direct,
+        );
+}
+
+fn semantic_closure_keys(
+    syntax: &FileAnalysis,
+    semantic: &SemanticProgram,
+    file_identities: &HashMap<PathBuf, PathBuf>,
+) -> HashMap<SymbolId, String> {
+    syntax
+        .functions
+        .iter()
+        .filter(|function| is_source_closure(function))
+        .filter_map(|closure| {
+            semantic
+                .functions
+                .iter()
+                .filter(|function| {
+                    source_file_identity(file_identities, &closure.span.file)
+                        == source_file_identity(file_identities, &function.body_span.file)
+                        && span_contains(&closure.span, &function.body_span)
+                })
+                .min_by_key(|function| span_size(&function.body_span))
+                .map(|function| (closure.id.clone(), function.key.clone()))
+        })
+        .collect()
+}
+
+fn source_closure_for_call<'a>(
+    owner: &FunctionInfo,
+    call: &CallSite,
+    functions: &'a [FunctionInfo],
+) -> Option<&'a FunctionInfo> {
+    let name = call_syntax_name(call)?;
+    let expected_container = owner.id.qualified_parts().join("::");
+    let expected_lambda = format!("λ{name}");
+    functions.iter().find(|function| {
+        is_source_closure(function)
+            && function.id.container.as_deref() == Some(expected_container.as_str())
+            && closure_label_callee(function) == expected_lambda
+    })
+}
+
+fn closure_label_callee(function: &FunctionInfo) -> &str {
+    outer_call_arguments_start(&function.label.default)
+        .map_or(function.label.default.as_str(), |start| {
+            &function.label.default[..start]
+        })
+}
+
+#[derive(Clone)]
+struct SemanticClosureSource {
+    span: SourceSpan,
+    identity: String,
+    lambda: String,
+}
+
+#[derive(Clone, Copy)]
+enum ClosureRewrite {
+    Identity,
+    Display,
+}
+
+fn canonicalize_semantic_closures(
+    syntax: &FileAnalysis,
+    semantic: &mut SemanticProgram,
+    file_identities: &HashMap<PathBuf, PathBuf>,
+) {
+    let closures = syntax
+        .functions
+        .iter()
+        .filter(|function| is_source_closure(function))
+        .map(|function| SemanticClosureSource {
+            span: function.span.clone(),
+            identity: format!("{{lambda-id:{}}}", function.id),
+            lambda: outer_call_arguments_start(&function.label.default).map_or_else(
+                || function.label.default.clone(),
+                |start| function.label.default[..start].to_owned(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    if closures.is_empty() {
+        return;
+    }
+
+    let mut direct_closures = HashMap::<String, (String, String)>::new();
+    for function in &semantic.functions {
+        let Some(source) = closure_for_body_span(&function.body_span, &closures, file_identities)
+        else {
+            continue;
+        };
+        let located_key = rewrite_located_closures(
+            &function.key,
+            &closures,
+            file_identities,
+            ClosureRewrite::Identity,
+        );
+        let key = replace_closure_definition(&located_key, &source.identity);
+        let display = closure_instance_display(&source.lambda, &function.display);
+        direct_closures.insert(function.key.clone(), (key, display));
+    }
+
+    for function in &mut semantic.functions {
+        let original_key = function.key.clone();
+        if let Some((key, display)) = direct_closures.get(&original_key) {
+            function.key = key.clone();
+            function.display = display.clone();
+        } else {
+            function.key = rewrite_located_closures(
+                &function.key,
+                &closures,
+                file_identities,
+                ClosureRewrite::Identity,
+            );
+            function.display = rewrite_located_closures(
+                &function.display,
+                &closures,
+                file_identities,
+                ClosureRewrite::Display,
+            );
+        }
+        for parameter in &mut function.parameter_types {
+            *parameter = rewrite_located_closures(
+                parameter,
+                &closures,
+                file_identities,
+                ClosureRewrite::Display,
+            );
+        }
+        for call in &mut function.calls {
+            for argument in &mut call.argument_types {
+                *argument = rewrite_located_closures(
+                    argument,
+                    &closures,
+                    file_identities,
+                    ClosureRewrite::Display,
+                );
+            }
+            match &mut call.target {
+                SemanticCallTarget::Direct { key, display } => {
+                    rewrite_closure_target(
+                        key,
+                        display,
+                        &direct_closures,
+                        &closures,
+                        file_identities,
+                    );
+                }
+                SemanticCallTarget::Dynamic {
+                    key,
+                    display,
+                    candidates,
+                    ..
+                } => {
+                    rewrite_closure_target(
+                        key,
+                        display,
+                        &direct_closures,
+                        &closures,
+                        file_identities,
+                    );
+                    for candidate in candidates {
+                        rewrite_closure_target(
+                            &mut candidate.key,
+                            &mut candidate.display,
+                            &direct_closures,
+                            &closures,
+                            file_identities,
+                        );
+                    }
+                }
+                SemanticCallTarget::Indirect { .. } => {}
+                SemanticCallTarget::Unresolved => {}
+            }
+        }
+    }
+}
+
+fn is_source_closure(function: &FunctionInfo) -> bool {
+    function.id.name.starts_with("{lambda:")
+}
+
+fn rewrite_closure_target(
+    key: &mut String,
+    display: &mut String,
+    direct_closures: &HashMap<String, (String, String)>,
+    closures: &[SemanticClosureSource],
+    file_identities: &HashMap<PathBuf, PathBuf>,
+) {
+    if let Some((canonical_key, canonical_display)) = direct_closures.get(key) {
+        *key = canonical_key.clone();
+        *display = canonical_display.clone();
+        return;
+    }
+    *key = rewrite_located_closures(key, closures, file_identities, ClosureRewrite::Identity);
+    *display =
+        rewrite_located_closures(display, closures, file_identities, ClosureRewrite::Display);
+}
+
+fn closure_for_body_span<'a>(
+    body: &SourceSpan,
+    closures: &'a [SemanticClosureSource],
+    file_identities: &HashMap<PathBuf, PathBuf>,
+) -> Option<&'a SemanticClosureSource> {
+    closures
+        .iter()
+        .filter(|closure| {
+            source_file_identity(file_identities, &closure.span.file)
+                == source_file_identity(file_identities, &body.file)
+                && span_contains(&closure.span, body)
+        })
+        .min_by_key(|closure| span_size(&closure.span))
+}
+
+fn rewrite_located_closures(
+    value: &str,
+    closures: &[SemanticClosureSource],
+    file_identities: &HashMap<PathBuf, PathBuf>,
+    rewrite: ClosureRewrite,
+) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remainder = value;
+    loop {
+        let located = ["{closure@", "{async closure@"]
+            .into_iter()
+            .filter_map(|prefix| remainder.find(prefix).map(|start| (start, prefix)))
+            .min_by_key(|(start, _)| *start);
+        let Some((start, prefix)) = located else {
+            output.push_str(remainder);
+            break;
+        };
+        output.push_str(&remainder[..start]);
+        let located = &remainder[start..];
+        let Some(end) = located.find('}') else {
+            output.push_str(located);
+            break;
+        };
+        let location = &located[prefix.len()..end];
+        let replacement = parse_anonymous_location(location).and_then(|(file, line, column)| {
+            closure_for_location(&file, line, column, closures, file_identities)
+        });
+        if let Some(closure) = replacement {
+            output.push_str(match rewrite {
+                ClosureRewrite::Identity => &closure.identity,
+                ClosureRewrite::Display => &closure.lambda,
+            });
+        } else {
+            output.push_str(&located[..=end]);
+        }
+        remainder = &located[end + 1..];
+    }
+    output
+}
+
+fn parse_anonymous_location(location: &str) -> Option<(PathBuf, usize, usize)> {
+    let mut fields = location.rsplitn(5, ':');
+    let _end_column = fields.next()?.trim().parse::<usize>().ok()?;
+    let _end_line = fields.next()?.trim().parse::<usize>().ok()?;
+    let start_column = fields.next()?.trim().parse::<usize>().ok()?;
+    let start_line = fields.next()?.trim().parse::<usize>().ok()?;
+    let file = PathBuf::from(fields.next()?.trim());
+    Some((file, start_line, start_column))
+}
+
+fn closure_for_location<'a>(
+    file: &Path,
+    line: usize,
+    column: usize,
+    closures: &'a [SemanticClosureSource],
+    file_identities: &HashMap<PathBuf, PathBuf>,
+) -> Option<&'a SemanticClosureSource> {
+    closures
+        .iter()
+        .filter(|closure| {
+            source_file_identity(file_identities, &closure.span.file)
+                == source_file_identity(file_identities, file)
+                && closure.span.start_line == line
+        })
+        .min_by_key(|closure| closure.span.start_column.saturating_add(1).abs_diff(column))
+}
+
+fn replace_closure_definition(value: &str, replacement: &str) -> String {
+    let Some(start) = ["{closure#", "{async closure#"]
+        .into_iter()
+        .filter_map(|prefix| value.rfind(prefix))
+        .max()
+    else {
+        return value.to_owned();
+    };
+    let Some(end) = value[start..].find('}').map(|end| start + end) else {
+        return value.to_owned();
+    };
+    format!("{}{replacement}{}", &value[..start], &value[end + 1..])
+}
+
+fn closure_instance_display(lambda: &str, semantic: &str) -> String {
+    let Some(start) = ["::{closure#", "::{async closure#"]
+        .into_iter()
+        .filter_map(|prefix| semantic.rfind(prefix))
+        .max()
+    else {
+        return lambda.to_owned();
+    };
+    let parent = &semantic[..start];
+    let Some(generic_start) = trailing_generic_arguments_start(parent) else {
+        return lambda.to_owned();
+    };
+    format!("{}{}", lambda, &parent[generic_start..])
+}
+
+fn source_file_identities(
+    syntax: &FileAnalysis,
+    semantic: &SemanticProgram,
+) -> HashMap<PathBuf, PathBuf> {
+    let mut paths = HashSet::<PathBuf>::new();
+    for function in &syntax.functions {
+        paths.insert(function.span.file.clone());
+        paths.extend(function.calls.iter().map(|call| call.span.file.clone()));
+    }
+    for function in &semantic.functions {
+        paths.insert(function.body_span.file.clone());
+        paths.extend(function.calls.iter().map(|call| call.span.file.clone()));
+    }
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let identity = path.canonicalize().unwrap_or_else(|_| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    env::current_dir().map_or_else(|_| path.clone(), |root| root.join(&path))
+                }
+            });
+            (path, identity)
+        })
+        .collect()
+}
+
+fn source_file_identity<'a>(identities: &'a HashMap<PathBuf, PathBuf>, path: &'a Path) -> &'a Path {
+    identities.get(path).map_or(path, PathBuf::as_path)
+}
+
 fn best_function_template<'a>(
     functions: &'a [FunctionInfo],
+    candidate_indices: &[usize],
     body_span: &SourceSpan,
 ) -> Option<&'a FunctionInfo> {
-    functions
+    candidate_indices
         .iter()
-        .filter(|function| {
-            source_files_match(&function.span.file, &body_span.file)
-                && span_contains(&function.span, body_span)
-        })
+        .filter_map(|index| functions.get(*index))
+        .filter(|function| span_contains(&function.span, body_span))
         .min_by_key(|function| span_size(&function.span))
 }
 
@@ -1825,19 +3466,27 @@ fn best_semantic_call(
     syntax_call: &CallSite,
     semantic_calls: &[SemanticCall],
     claimed: &HashSet<usize>,
+    file_identities: &HashMap<PathBuf, PathBuf>,
 ) -> Option<usize> {
-    let syntax_name = match &syntax_call.syntax {
-        CallSyntax::Path(parts) => parts.last().map(String::as_str),
-        CallSyntax::SelfMethod(method) | CallSyntax::Method { method, .. } => Some(method.as_str()),
-    }?;
+    let syntax_name = call_syntax_name(syntax_call)?;
 
     semantic_calls
         .iter()
         .enumerate()
         .filter(|(index, call)| {
-            !claimed.contains(index)
-                && source_files_match(&syntax_call.span.file, &call.span.file)
-                && spans_overlap(&syntax_call.span, &call.span)
+            if claimed.contains(index)
+                || source_file_identity(file_identities, &syntax_call.span.file)
+                    != source_file_identity(file_identities, &call.span.file)
+                || !spans_overlap(&syntax_call.span, &call.span)
+            {
+                return false;
+            }
+            let definition_leaf = call
+                .definition_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(&call.definition_name);
+            definition_leaf == syntax_name || span_coordinates_equal(&syntax_call.span, &call.span)
         })
         .min_by_key(|(_, call)| {
             let definition_leaf = call
@@ -1851,6 +3500,20 @@ fn best_semantic_call(
         .map(|(index, _)| index)
 }
 
+fn call_syntax_name(call: &CallSite) -> Option<&str> {
+    match &call.syntax {
+        CallSyntax::Path(parts) => parts.last().map(String::as_str),
+        CallSyntax::SelfMethod(method) | CallSyntax::Method { method, .. } => Some(method.as_str()),
+    }
+}
+
+fn span_coordinates_equal(left: &SourceSpan, right: &SourceSpan) -> bool {
+    left.start_line == right.start_line
+        && left.start_column == right.start_column
+        && left.end_line == right.end_line
+        && left.end_column == right.end_column
+}
+
 fn semantic_symbol(name: String) -> SymbolId {
     SymbolId {
         language: LanguageId::new("rust"),
@@ -1861,14 +3524,46 @@ fn semantic_symbol(name: String) -> SymbolId {
 }
 
 fn normalize_instance_key(name: &str) -> String {
-    name.replace("::<", "<")
+    normalize_anonymous_type_locations(&name.replace("::<", "<"))
 }
 
 fn normalize_instance_display(name: &str, crate_name: &str) -> String {
-    let compact = name
-        .replace(&format!("{crate_name}::"), "")
-        .replace("::<", "<");
+    let without_crate = if crate_name.is_empty() {
+        name.to_owned()
+    } else {
+        name.replace(&format!("{crate_name}::"), "")
+    };
+    let compact = normalize_anonymous_type_locations(&without_crate.replace("::<", "<"));
     collapse_trait_qualification(&compact)
+}
+
+fn normalize_anonymous_type_locations(value: &str) -> String {
+    [
+        ("{async block@", "{async block}"),
+        ("{coroutine@", "{coroutine}"),
+        ("{generator@", "{generator}"),
+    ]
+    .into_iter()
+    .fold(value.to_owned(), |value, (prefix, replacement)| {
+        replace_braced_location(&value, prefix, replacement)
+    })
+}
+
+fn replace_braced_location(value: &str, prefix: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remainder = value;
+    while let Some(start) = remainder.find(prefix) {
+        output.push_str(&remainder[..start]);
+        let located = &remainder[start..];
+        let Some(end) = located.find('}') else {
+            output.push_str(located);
+            return output;
+        };
+        output.push_str(replacement);
+        remainder = &located[end + 1..];
+    }
+    output.push_str(remainder);
+    output
 }
 
 fn collapse_trait_qualification(name: &str) -> String {
@@ -1895,7 +3590,7 @@ fn replace_label_callee(label: &CallLabel, callee: &str) -> CallLabel {
 }
 
 fn replace_callee_text(label: &str, callee: &str) -> String {
-    let rendered = if let Some(arguments_start) = outer_call_arguments_start(label) {
+    if let Some(arguments_start) = outer_call_arguments_start(label) {
         format!(
             "{}{}",
             semantic_callee(&label[..arguments_start], callee),
@@ -1903,21 +3598,13 @@ fn replace_callee_text(label: &str, callee: &str) -> String {
         )
     } else {
         semantic_callee(label, callee)
-    };
-    match closure_ordinal(callee) {
-        Some(ordinal) if !label.contains("closure#") => {
-            format!("{rendered} [closure#{ordinal}]")
-        }
-        Some(_) | None => rendered,
     }
 }
 
-fn closure_ordinal(callee: &str) -> Option<&str> {
-    let rest = callee.split("{closure#").nth(1)?;
-    rest.split('}').next()
-}
-
 fn semantic_callee(source: &str, semantic: &str) -> String {
+    if semantic.starts_with('λ') {
+        return semantic.to_owned();
+    }
     if semantic.starts_with("dyn ") {
         return semantic.rsplit_once("::").map_or_else(
             || semantic.to_owned(),
@@ -1972,7 +3659,9 @@ fn simplify_type_paths(value: &str) -> String {
 }
 
 fn normalize_type_display(value: &str, crate_name: &str) -> String {
-    simplify_type_paths(&value.replace(&format!("{crate_name}::"), ""))
+    simplify_type_paths(&normalize_anonymous_type_locations(
+        &value.replace(&format!("{crate_name}::"), ""),
+    ))
 }
 
 fn semantic_call_argument_types(call: &SemanticCall) -> Vec<String> {
@@ -2194,7 +3883,7 @@ fn span_distance(left: &SourceSpan, right: &SourceSpan) -> usize {
         + left.start_column.abs_diff(right.start_column)
 }
 
-impl LanguageFrontend for RustSourceExtractor {
+impl LanguageBackend for RustBackend {
     fn language(&self) -> LanguageId {
         LanguageId::new("rust")
     }
@@ -2210,8 +3899,24 @@ impl LanguageFrontend for RustSourceExtractor {
     ) -> FrontendResult<FileAnalysis> {
         let syntax = syn::parse_file(source)?;
         let mut analysis = FileAnalysis::default();
+        analysis.source_files.insert(context.path.to_path_buf());
         analyze_items(context.path, context.module, &syntax.items, &mut analysis);
         Ok(analysis)
+    }
+
+    fn analyze_project(&self, context: &ProjectContext<'_>) -> FrontendResult<FileAnalysis> {
+        let wrapper = context.driver_executable.ok_or_else(|| {
+            std::io::Error::other("Rust project analysis requires a driver executable")
+        })?;
+        let session = match context.cache {
+            Some(cache) => RustProjectSession::create_cached(
+                cache.project_root,
+                cache.endpoint,
+                cache.verbose,
+            )?,
+            None => RustProjectSession::create()?,
+        };
+        analyze_semantic_project(context.root, wrapper, context.entries, &session)
     }
 }
 
@@ -2335,11 +4040,12 @@ fn add_closure_functions(
     block: &syn::Block,
     analysis: &mut FileAnalysis,
 ) {
+    let closure_sources = closure_sources(block);
     let mut extractor = ClosureExtractor {
         file,
         module,
         owner,
-        next_ordinal: 0,
+        closure_sources: &closure_sources,
         functions: Vec::new(),
     };
     extractor.visit_block(block);
@@ -2350,15 +4056,19 @@ struct ClosureExtractor<'a> {
     file: &'a Path,
     module: &'a [String],
     owner: &'a SymbolId,
-    next_ordinal: usize,
+    closure_sources: &'a HashMap<ClosureSpan, ClosureSource>,
     functions: Vec<FunctionInfo>,
 }
 
 impl<'ast> Visit<'ast> for ClosureExtractor<'_> {
     fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
-        let ordinal = self.next_ordinal;
-        self.next_ordinal += 1;
-        let closure_name = format!("{{closure#{ordinal}}}");
+        let source = self
+            .closure_sources
+            .get(&closure_span(node.span()))
+            .cloned()
+            .unwrap_or_else(|| ClosureSource::anonymous(self.functions.len()));
+        let closure_name = format!("{{lambda:{}}}", source.identity);
+        let lambda = source.lambda_name();
         let id = SymbolId {
             language: LanguageId::new("rust"),
             module: self.module.to_vec(),
@@ -2367,6 +4077,7 @@ impl<'ast> Visit<'ast> for ClosureExtractor<'_> {
         };
         let mut calls = CallCollector {
             file: self.file,
+            closure_sources: self.closure_sources,
             calls: Vec::new(),
         };
         calls.visit_expr(&node.body);
@@ -2386,8 +4097,8 @@ impl<'ast> Visit<'ast> for ClosureExtractor<'_> {
         self.functions.push(FunctionInfo {
             id,
             label: CallLabel::with_types(
-                format!("{closure_name}({})", parameters.join(", ")),
-                format!("{closure_name}({})", typed_parameters.join(", ")),
+                format!("{lambda}({})", parameters.join(", ")),
+                format!("{lambda}({})", typed_parameters.join(", ")),
             ),
             public: false,
             calls: calls.calls,
@@ -2414,11 +4125,14 @@ fn function_from_parts(
         container,
         name: signature.ident.to_string(),
     };
+    let closure_sources = closure_sources(block);
     let mut collector = CallCollector {
         file,
+        closure_sources: &closure_sources,
         calls: Vec::new(),
     };
     collector.visit_block(block);
+    rewrite_symbolic_generic_calls(module, signature, &mut collector.calls);
 
     FunctionInfo {
         label: function_label(&id, signature),
@@ -2435,6 +4149,39 @@ fn add_signature_facts(
     signature: &Signature,
     analysis: &mut FileAnalysis,
 ) {
+    for parameter in &signature.generics.params {
+        let (key, value) = match parameter {
+            syn::GenericParam::Lifetime(parameter) => (
+                parameter.lifetime.to_string(),
+                parameter
+                    .bounds
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+            ),
+            syn::GenericParam::Type(parameter) => (
+                parameter.ident.to_string(),
+                parameter
+                    .bounds
+                    .iter()
+                    .map(compact_tokens)
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+            ),
+            syn::GenericParam::Const(parameter) => {
+                (parameter.ident.to_string(), compact_tokens(&parameter.ty))
+            }
+        };
+        analysis.facts.push(LanguageFact {
+            subject: function.id.clone(),
+            namespace: LanguageId::new("rust"),
+            kind: "generic-parameter".to_owned(),
+            key,
+            value,
+            span: source_span(file, parameter.span()),
+        });
+    }
     for input in &signature.inputs {
         match input {
             FnArg::Receiver(receiver) => {
@@ -2523,16 +4270,7 @@ fn parameter_names(signature: &Signature) -> String {
 }
 
 fn function_label(id: &SymbolId, signature: &Signature) -> CallLabel {
-    let generic_names = signature
-        .generics
-        .params
-        .iter()
-        .map(|parameter| match parameter {
-            syn::GenericParam::Lifetime(lifetime) => lifetime.lifetime.to_string(),
-            syn::GenericParam::Type(parameter) => parameter.ident.to_string(),
-            syn::GenericParam::Const(parameter) => parameter.ident.to_string(),
-        })
-        .collect::<Vec<_>>();
+    let generic_names = generic_parameter_labels(signature);
     let generics = if generic_names.is_empty() {
         String::new()
     } else {
@@ -2549,6 +4287,159 @@ fn function_label(id: &SymbolId, signature: &Signature) -> CallLabel {
         typed_parameters(signature)
     );
     CallLabel::with_types(default, typed)
+}
+
+fn generic_parameter_labels(signature: &Signature) -> Vec<String> {
+    let mut where_bounds = HashMap::<String, Vec<String>>::new();
+    if let Some(where_clause) = &signature.generics.where_clause {
+        for predicate in &where_clause.predicates {
+            let syn::WherePredicate::Type(predicate) = predicate else {
+                continue;
+            };
+            let key = compact_tokens(&predicate.bounded_ty);
+            where_bounds
+                .entry(key)
+                .or_default()
+                .extend(predicate.bounds.iter().map(compact_tokens));
+        }
+    }
+
+    signature
+        .generics
+        .params
+        .iter()
+        .map(|parameter| match parameter {
+            syn::GenericParam::Lifetime(parameter) => {
+                let mut bounds = parameter
+                    .bounds
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                bounds.extend(
+                    where_bounds
+                        .get(&parameter.lifetime.to_string())
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                format_generic_parameter(parameter.lifetime.to_string(), bounds)
+            }
+            syn::GenericParam::Type(parameter) => {
+                let name = parameter.ident.to_string();
+                let mut bounds = parameter
+                    .bounds
+                    .iter()
+                    .map(compact_tokens)
+                    .collect::<Vec<_>>();
+                bounds.extend(where_bounds.get(&name).cloned().unwrap_or_default());
+                format_generic_parameter(name, bounds)
+            }
+            syn::GenericParam::Const(parameter) => {
+                format!(
+                    "const {}: {}",
+                    parameter.ident,
+                    compact_tokens(&parameter.ty)
+                )
+            }
+        })
+        .collect()
+}
+
+fn format_generic_parameter(name: String, mut bounds: Vec<String>) -> String {
+    bounds.retain(|bound| !bound.is_empty());
+    bounds.sort();
+    bounds.dedup();
+    if bounds.is_empty() {
+        name
+    } else {
+        format!("{name}: {}", bounds.join(" + "))
+    }
+}
+
+fn rewrite_symbolic_generic_calls(
+    module: &[String],
+    signature: &Signature,
+    calls: &mut [CallSite],
+) {
+    let generic_bounds = generic_type_bounds(signature);
+    if generic_bounds.is_empty() {
+        return;
+    }
+    let receivers = signature
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let FnArg::Typed(argument) = input else {
+                return None;
+            };
+            let parameter = simple_pattern_binding(&argument.pat)?;
+            let generic = simple_generic_type(&argument.ty)?;
+            generic_bounds
+                .contains_key(&generic)
+                .then_some((parameter, generic))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for call in calls {
+        let CallSyntax::Method { receiver, method } = &call.syntax else {
+            continue;
+        };
+        let Some(generic) = receivers.get(receiver) else {
+            continue;
+        };
+        let bound = generic_bounds
+            .get(generic)
+            .and_then(|bounds| (bounds.len() == 1).then(|| bounds[0].clone()));
+        call.target = CallTarget::Direct(SymbolId {
+            language: LanguageId::new("rust"),
+            module: module.to_vec(),
+            container: Some(
+                bound.map_or_else(|| generic.clone(), |bound| format!("{generic} as {bound}")),
+            ),
+            name: method.clone(),
+        });
+        call.label = replace_label_callee(&call.label, &format!("{generic}::{method}"));
+    }
+}
+
+fn generic_type_bounds(signature: &Signature) -> HashMap<String, Vec<String>> {
+    let mut result = HashMap::<String, Vec<String>>::new();
+    for parameter in &signature.generics.params {
+        let syn::GenericParam::Type(parameter) = parameter else {
+            continue;
+        };
+        result.insert(
+            parameter.ident.to_string(),
+            parameter.bounds.iter().map(compact_tokens).collect(),
+        );
+    }
+    if let Some(where_clause) = &signature.generics.where_clause {
+        for predicate in &where_clause.predicates {
+            let syn::WherePredicate::Type(predicate) = predicate else {
+                continue;
+            };
+            let name = compact_tokens(&predicate.bounded_ty);
+            if let Some(bounds) = result.get_mut(&name) {
+                bounds.extend(predicate.bounds.iter().map(compact_tokens));
+            }
+        }
+    }
+    for bounds in result.values_mut() {
+        bounds.sort();
+        bounds.dedup();
+    }
+    result
+}
+
+fn simple_generic_type(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+            Some(path.path.segments[0].ident.to_string())
+        }
+        syn::Type::Reference(reference) => simple_generic_type(&reference.elem),
+        syn::Type::Group(group) => simple_generic_type(&group.elem),
+        syn::Type::Paren(paren) => simple_generic_type(&paren.elem),
+        _ => None,
+    }
 }
 
 fn typed_parameters(signature: &Signature) -> String {
@@ -2614,23 +4505,31 @@ fn source_span(file: &Path, span: Span) -> SourceSpan {
 
 struct CallCollector<'a> {
     file: &'a Path,
+    closure_sources: &'a HashMap<ClosureSpan, ClosureSource>,
     calls: Vec<CallSite>,
 }
 
 impl<'ast> Visit<'ast> for CallCollector<'_> {
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        // MIR evaluates nested calls before their enclosing expression. Keep
+        // the same order so an aggregate constructor such as `Some(f())`
+        // cannot claim `f`'s semantic call span.
+        visit::visit_expr_call(self, node);
         if let Some(parts) = callable_path(&node.func) {
+            let syntax = CallSyntax::Path(parts);
+            let span = source_span(self.file, node.span());
             self.calls.push(CallSite {
-                syntax: CallSyntax::Path(parts),
+                id: CallSiteId::source(&syntax, &span),
+                syntax,
                 target: CallTarget::Unresolved,
-                label: CallLabel::new(call_expression_label(node)),
-                span: source_span(self.file, node.span()),
+                label: CallLabel::new(call_expression_label(node, self.closure_sources)),
+                span,
             });
         }
-        visit::visit_expr_call(self, node);
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        visit::visit_expr_method_call(self, node);
         let method = node.method.to_string();
         let syntax = if is_self_expr(&node.receiver) {
             CallSyntax::SelfMethod(method)
@@ -2640,13 +4539,14 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
                 method,
             }
         };
+        let span = source_span(self.file, node.span());
         self.calls.push(CallSite {
+            id: CallSiteId::source(&syntax, &span),
             syntax,
             target: CallTarget::Unresolved,
-            label: CallLabel::new(method_call_label(node)),
-            span: source_span(self.file, node.span()),
+            label: CallLabel::new(method_call_label(node, self.closure_sources)),
+            span,
         });
-        visit::visit_expr_method_call(self, node);
     }
 
     // Nested closures and local functions own their calls; do not attribute them
@@ -2656,26 +4556,287 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
 }
 
-fn call_expression_label(node: &ExprCall) -> String {
+fn call_expression_label(
+    node: &ExprCall,
+    closure_sources: &HashMap<ClosureSpan, ClosureSource>,
+) -> String {
     let function = compact_tokens(&node.func).replace("::<", "<");
-    let arguments = node.args.iter().map(compact_tokens).collect::<Vec<_>>();
+    let (closure_types, arguments) = call_arguments(&node.args, closure_sources);
+    let function = append_generic_arguments(&function, &closure_types);
     format!("{function}({})", arguments.join(", "))
 }
 
-fn method_call_label(node: &ExprMethodCall) -> String {
-    let receiver = compact_tokens(&node.receiver);
+fn method_call_label(
+    node: &ExprMethodCall,
+    closure_sources: &HashMap<ClosureSpan, ClosureSource>,
+) -> String {
+    let receiver = simple_receiver(&node.receiver)
+        .then(|| compact_expression(&node.receiver, closure_sources));
     let generics = node
         .turbofish
         .as_ref()
         .map(compact_tokens)
         .unwrap_or_default()
         .replace("::<", "<");
-    let arguments = node.args.iter().map(compact_tokens).collect::<Vec<_>>();
-    format!(
-        "{receiver}.{}{generics}({})",
-        node.method,
-        arguments.join(", ")
-    )
+    let (closure_types, arguments) = call_arguments(&node.args, closure_sources);
+    let method = format!("{}{generics}", node.method);
+    let callee = receiver.map_or(method.clone(), |receiver| format!("{receiver}.{method}"));
+    let callee = append_generic_arguments(&callee, &closure_types);
+    format!("{callee}({})", arguments.join(", "))
+}
+
+type ClosureSpan = (usize, usize, usize, usize);
+
+#[derive(Clone, Debug)]
+struct ClosureSource {
+    ordinal: usize,
+    binding: Option<String>,
+    identity: String,
+}
+
+impl ClosureSource {
+    fn anonymous(ordinal: usize) -> Self {
+        Self {
+            ordinal,
+            binding: None,
+            identity: format!("fallback-{ordinal}"),
+        }
+    }
+
+    fn lambda_name(&self) -> String {
+        self.binding.as_ref().map_or_else(
+            || format!("λ#{}", self.ordinal + 1),
+            |name| format!("λ{name}"),
+        )
+    }
+}
+
+fn closure_span(span: Span) -> ClosureSpan {
+    let start = span.start();
+    let end = span.end();
+    (start.line, start.column, end.line, end.column)
+}
+
+fn closure_sources(block: &syn::Block) -> HashMap<ClosureSpan, ClosureSource> {
+    let mut collector = ClosureOrdinalCollector::default();
+    collector.visit_block(block);
+    collector.sources
+}
+
+#[derive(Default)]
+struct ClosureOrdinalCollector {
+    sources: HashMap<ClosureSpan, ClosureSource>,
+    bindings: HashMap<ClosureSpan, String>,
+    identity_counts: HashMap<String, usize>,
+}
+
+impl<'ast> Visit<'ast> for ClosureOrdinalCollector {
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if let Some(initializer) = &node.init
+            && let Some(closure) = direct_closure_expression(&initializer.expr)
+            && let Some(binding) = simple_pattern_binding(&node.pat)
+        {
+            self.bindings.insert(closure_span(closure.span()), binding);
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
+        let span = closure_span(node.span());
+        let ordinal = self.sources.len();
+        let base_identity = closure_structural_identity(node);
+        let occurrence = self
+            .identity_counts
+            .entry(base_identity.clone())
+            .or_default();
+        let identity = if *occurrence == 0 {
+            base_identity
+        } else {
+            format!("{base_identity}-{}", *occurrence + 1)
+        };
+        *occurrence += 1;
+        self.sources.insert(
+            span,
+            ClosureSource {
+                ordinal,
+                binding: self.bindings.get(&span).cloned(),
+                identity,
+            },
+        );
+        visit::visit_expr_closure(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
+fn closure_structural_identity(node: &ExprClosure) -> String {
+    let signature = format!(
+        "{}:{}:{}:{}",
+        node.asyncness.is_some(),
+        node.movability.is_some(),
+        node.capture.is_some(),
+        node.inputs
+            .iter()
+            .map(compact_tokens)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(signature.as_bytes());
+    format!("{:x}", hasher.finalize())[..12].to_owned()
+}
+
+struct ClosureLabelRedactor<'a> {
+    closure_sources: &'a HashMap<ClosureSpan, ClosureSource>,
+    used: Vec<(String, String)>,
+}
+
+impl VisitMut for ClosureLabelRedactor<'_> {
+    fn visit_expr_mut(&mut self, node: &mut Expr) {
+        let Expr::Closure(closure) = node else {
+            visit_mut::visit_expr_mut(self, node);
+            return;
+        };
+        let Some(source) = self
+            .closure_sources
+            .get(&closure_span(closure.span()))
+            .cloned()
+        else {
+            return;
+        };
+        let marker = format!("__diffkit_closure_placeholder_{}", source.ordinal);
+        self.used.push((marker.clone(), source.lambda_name()));
+        let ident = syn::Ident::new(&marker, closure.span());
+        *node = Expr::Path(syn::ExprPath {
+            attrs: Vec::new(),
+            qself: None,
+            path: syn::Path::from(ident),
+        });
+    }
+}
+
+fn compact_expression(
+    expression: &Expr,
+    closure_sources: &HashMap<ClosureSpan, ClosureSource>,
+) -> String {
+    let mut expression = expression.clone();
+    let mut redactor = ClosureLabelRedactor {
+        closure_sources,
+        used: Vec::new(),
+    };
+    redactor.visit_expr_mut(&mut expression);
+    let mut rendered = compact_tokens(&expression);
+    for (marker, lambda) in redactor.used {
+        rendered = rendered.replace(&marker, &lambda);
+    }
+    rendered
+}
+
+fn call_argument_label(
+    expression: &Expr,
+    closure_sources: &HashMap<ClosureSpan, ClosureSource>,
+) -> String {
+    let rendered = compact_expression(expression, closure_sources);
+    if rendered.chars().count() <= 96 {
+        rendered
+    } else {
+        "…".to_owned()
+    }
+}
+
+fn call_arguments(
+    arguments: &syn::punctuated::Punctuated<Expr, syn::Token![,]>,
+    closure_sources: &HashMap<ClosureSpan, ClosureSource>,
+) -> (Vec<String>, Vec<String>) {
+    let mut closure_types = Vec::new();
+    let mut values = Vec::new();
+    for argument in arguments {
+        if let Some(source) = closure_source_for_expression(argument, closure_sources) {
+            closure_types.push(source.lambda_name());
+        } else {
+            values.push(call_argument_label(argument, closure_sources));
+        }
+    }
+    (closure_types, values)
+}
+
+fn closure_source_for_expression<'a>(
+    expression: &Expr,
+    closure_sources: &'a HashMap<ClosureSpan, ClosureSource>,
+) -> Option<&'a ClosureSource> {
+    if let Some(closure) = direct_closure_expression(expression) {
+        return closure_sources.get(&closure_span(closure.span()));
+    }
+    let Expr::Path(path) = expression else {
+        return None;
+    };
+    let binding = path.path.get_ident()?.to_string();
+    closure_sources
+        .values()
+        .find(|source| source.binding.as_deref() == Some(binding.as_str()))
+}
+
+fn direct_closure_expression(expression: &Expr) -> Option<&ExprClosure> {
+    match expression {
+        Expr::Closure(closure) => Some(closure),
+        Expr::Group(group) => direct_closure_expression(&group.expr),
+        Expr::Paren(paren) => direct_closure_expression(&paren.expr),
+        _ => None,
+    }
+}
+
+fn simple_pattern_binding(pattern: &Pat) -> Option<String> {
+    match pattern {
+        Pat::Ident(identifier) => Some(identifier.ident.to_string()),
+        Pat::Type(typed) => simple_pattern_binding(&typed.pat),
+        _ => None,
+    }
+}
+
+fn append_generic_arguments(callee: &str, additions: &[String]) -> String {
+    if additions.is_empty() {
+        return callee.to_owned();
+    }
+    let additions = additions.join(", ");
+    let Some(start) = trailing_generic_arguments_start(callee) else {
+        return format!("{callee}<{additions}>");
+    };
+    let existing = &callee[start + 1..callee.len() - 1];
+    let separator = if existing.is_empty() { "" } else { ", " };
+    format!("{}<{existing}{separator}{additions}>", &callee[..start])
+}
+
+fn trailing_generic_arguments_start(value: &str) -> Option<usize> {
+    if !value.ends_with('>') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, character) in value.char_indices().rev() {
+        match character {
+            '>' => depth += 1,
+            '<' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn simple_receiver(expression: &Expr) -> bool {
+    match expression {
+        Expr::Path(_) => true,
+        Expr::Field(field) => simple_receiver(&field.base),
+        Expr::Index(index) => simple_receiver(&index.expr),
+        Expr::Paren(paren) => simple_receiver(&paren.expr),
+        Expr::Group(group) => simple_receiver(&group.expr),
+        Expr::Reference(reference) => simple_receiver(&reference.expr),
+        Expr::Unary(unary) => simple_receiver(&unary.expr),
+        _ => false,
+    }
 }
 
 fn callable_path(expression: &Expr) -> Option<Vec<String>> {
@@ -2735,7 +4896,7 @@ mod tests {
                 }
             }
         "#;
-        let frontend = RustSourceExtractor;
+        let frontend = RustBackend;
         let analysis = frontend
             .analyze_file(
                 &FileContext {
@@ -2764,6 +4925,61 @@ mod tests {
     }
 
     #[test]
+    fn closure_arguments_are_labels_not_serialized_bodies() {
+        let source = r#"
+            fn run(values: &[String]) {
+                values
+                    .iter()
+                    .filter_map(|value| {
+                        parse(value);
+                        Some(value)
+                    })
+                    .collect::<Vec<_>>();
+            }
+            fn parse(_: &String) {}
+        "#;
+        let frontend = RustBackend;
+        let analysis = frontend
+            .analyze_file(
+                &FileContext {
+                    path: Path::new("src/lib.rs"),
+                    module: &[],
+                },
+                source,
+            )
+            .unwrap();
+
+        let run = analysis
+            .functions
+            .iter()
+            .find(|function| function.label.default.starts_with("run("))
+            .unwrap();
+        let labels = run
+            .calls
+            .iter()
+            .map(|call| call.label.default.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            ["values.iter()", "filter_map<λ#1>()", "collect<Vec<_>>()",]
+        );
+        assert!(labels.iter().all(|label| !label.contains("parse(value)")));
+
+        let closure = analysis
+            .functions
+            .iter()
+            .find(|function| function.label.default.starts_with("λ#1("))
+            .unwrap();
+        assert!(
+            closure
+                .calls
+                .iter()
+                .any(|call| call.label.default == "parse(value)")
+        );
+    }
+
+    #[test]
     fn rustc_public_can_analyze_a_compilable_file() {
         let directory =
             std::env::temp_dir().join(format!("diffkit-rustc-public-{}", std::process::id()));
@@ -2784,6 +5000,91 @@ mod tests {
                 .functions
                 .iter()
                 .any(|function| function.id.name.ends_with("::helper"))
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn semantic_analysis_omits_enum_variant_constructors() {
+        let directory = std::env::temp_dir().join(format!(
+            "diffkit-rustc-public-constructors-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("input.rs");
+        let source = r#"
+            pub struct Node;
+            pub fn root(before: Option<&Node>, after: Option<&Node>) -> Option<()> {
+                match (before, after) {
+                    (Some(before), Some(after)) => Some(inner(Some(before), Some(after))),
+                    _ => None,
+                }
+            }
+            fn inner(_: Option<&Node>, _: Option<&Node>) {}
+            pub fn is_json(value: Option<&str>) -> bool { value == Some("json") }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let analysis = analyze_semantic_file(&path).unwrap();
+        let root = analysis
+            .functions
+            .iter()
+            .find(|function| function.label.default.starts_with("root("))
+            .unwrap();
+        let calls = root
+            .calls
+            .iter()
+            .map(|call| call.label.default.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls, ["inner(Some(before), Some(after))"]);
+        let is_json = analysis
+            .functions
+            .iter()
+            .find(|function| function.label.default.starts_with("is_json("))
+            .unwrap();
+        assert!(is_json.calls.is_empty(), "{:#?}", is_json.calls);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn semantic_labels_do_not_expose_external_inferred_generics_or_closure_bodies() {
+        let directory = std::env::temp_dir().join(format!(
+            "diffkit-rustc-public-call-labels-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("input.rs");
+        fs::write(
+            &path,
+            r#"
+                pub fn run(values: &[String]) -> Vec<usize> {
+                    values
+                        .iter()
+                        .filter_map(|value| value.parse::<usize>().ok())
+                        .collect()
+                }
+            "#,
+        )
+        .unwrap();
+
+        let analysis = analyze_semantic_file(&path).unwrap();
+        let run = analysis
+            .functions
+            .iter()
+            .find(|function| function.label.default.starts_with("run("))
+            .unwrap();
+        let labels = run
+            .calls
+            .iter()
+            .map(|call| call.label.default.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, ["values.iter()", "filter_map<λ#1>()", "collect()"]);
+        assert!(
+            labels
+                .iter()
+                .all(|label| !label.contains("impl ") && !label.contains("|value|"))
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2866,5 +5167,48 @@ mod tests {
             label == "run<S3>(storage, order)" && calls.iter().any(|call| call == "S3::save(order)")
         }));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn specialization_consumes_duplicate_normalized_instances() {
+        let span = SourceSpan {
+            file: PathBuf::from("src/lib.rs"),
+            start_line: 1,
+            start_column: 1,
+            start_byte: None,
+            end_line: 1,
+            end_column: 1,
+            end_byte: None,
+        };
+        let function = || RawSemanticFunction {
+            key: "crate::duplicate".to_owned(),
+            display: "duplicate".to_owned(),
+            body_span: span.clone(),
+            calls: Vec::new(),
+            constructor_spans: Vec::new(),
+            constructor_names: Vec::new(),
+            parameter_types: Vec::new(),
+        };
+
+        let specialized =
+            specialize_semantic_functions(&[function(), function()], &[], &HashMap::new(), "crate");
+
+        assert_eq!(specialized.len(), 1);
+        assert_eq!(specialized[0].key, "crate::duplicate");
+    }
+
+    #[test]
+    fn closure_locations_survive_until_the_source_lambda_mapping() {
+        assert_eq!(
+            normalize_instance_key("core::result::Result::map::<{closure@src/lib.rs:10:4: 10:12}>"),
+            "core::result::Result::map<{closure@src/lib.rs:10:4: 10:12}>"
+        );
+        assert_eq!(
+            normalize_type_display(
+                "diffkit::Runner<{async block@src/lib.rs:20:8: 24:9}>",
+                "diffkit"
+            ),
+            "Runner<{async block}>"
+        );
     }
 }

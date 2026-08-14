@@ -307,6 +307,15 @@ fn dyn_root_without_a_concrete_provenance_is_unresolved() {
         "{rendered}"
     );
     assert!(!rendered.contains("… unresolved targets"), "{rendered}");
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("evidence=exact-flow")
+                && diagnostic.contains("opaque input")),
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 #[test]
@@ -454,7 +463,82 @@ fn renders_closure_instances_without_attributing_their_body_to_the_parent() {
 
     assert_eq!(
         render_plain(&report),
-        "rustdiff before.rs → after.rs\n\n  run(order)\n  └─ persist(order) [closure#0]\n     ├─ write(value)\n+    └─ commit()"
+        "rustdiff before.rs → after.rs\n\n  run(order)\n  └─ λpersist(order)\n     ├─ write(value)\n+    └─ commit()"
+    );
+}
+
+#[test]
+fn renders_generic_closure_instances_as_lambda_trees() {
+    let before = r#"
+        fn apply<F: Fn()>(f: F) { f(); }
+        pub fn run() {
+            apply(|| db::save());
+            apply(|| cache::save());
+        }
+        mod db { pub fn save() { write(); } fn write() {} }
+        mod cache { pub fn save() { store(); } fn store() {} }
+    "#;
+    let after = before
+        .replace(
+            "pub fn save() { write(); }",
+            "pub fn save() { write(); audit(); } fn audit() {}",
+        )
+        .replace(
+            "pub fn save() { store(); }",
+            "pub fn save() { store(); flush(); } fn flush() {}",
+        );
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_plain(&report),
+        "rustdiff before.rs → after.rs\n\n  run()\n  ├─ apply<λ#1>()\n  │  └─ λ#1()\n  │     └─ db::save()\n  │        ├─ write()\n+ │        └─ audit()\n  └─ apply<λ#2>()\n     └─ λ#2()\n        └─ cache::save()\n           ├─ store()\n+          └─ flush()"
+    );
+}
+
+#[test]
+fn closure_instances_inherit_their_parent_generic_arguments() {
+    let before = r#"
+        trait Storage { fn save(&self); }
+        struct Postgres;
+        impl Storage for Postgres { fn save(&self) { sql(); } }
+        struct S3;
+        impl Storage for S3 { fn save(&self) { upload(); } }
+        fn process<S: Storage>(storage: S) {
+            let save = || storage.save();
+            save();
+        }
+        pub fn entry() { process(Postgres); process(S3); }
+        fn sql() {}
+        fn upload() {}
+    "#;
+    let after = before
+        .replace("fn sql() {}", "fn sql() { commit(); } fn commit() {}")
+        .replace("fn upload() {}", "fn upload() { flush(); } fn flush() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["entry".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_plain(&report),
+        "rustdiff before.rs → after.rs\n\n  entry()\n  ├─ process<Postgres>(Postgres)\n  │  └─ λsave<Postgres>()\n  │     └─ Postgres::save()\n  │        └─ sql()\n+ │           └─ commit()\n  └─ process<S3>(S3)\n     └─ λsave<S3>()\n        └─ S3::save()\n           └─ upload()\n+             └─ flush()"
     );
 }
 
@@ -488,6 +572,41 @@ fn keeps_async_trees_source_logical_instead_of_showing_poll_runtime() {
 }
 
 #[test]
+fn renders_async_closures_with_the_same_lambda_shape() {
+    let before = r#"
+        pub async fn run() {
+            let task = async || { worker().await; };
+            task().await;
+        }
+        async fn worker() {}
+    "#;
+    let after = r#"
+        pub async fn run() {
+            let task = async || { worker().await; finish(); };
+            task().await;
+        }
+        async fn worker() {}
+        fn finish() {}
+    "#;
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_plain(&report),
+        "rustdiff before.rs → after.rs\n\n  run()\n  └─ λtask()\n     ├─ worker()\n+    └─ finish()"
+    );
+}
+
+#[test]
 fn recursive_calls_render_one_ancestor_and_a_direct_back_edge() {
     let before = "fn a() { b(); }\nfn b() { a(); }\n";
     let after = "fn a() { b(); }\nfn b() { finish(); a(); }\nfn finish() {}\n";
@@ -507,4 +626,163 @@ fn recursive_calls_render_one_ancestor_and_a_direct_back_edge() {
     assert!(rendered.contains('◀'), "{rendered}");
     assert!(rendered.contains('┘'), "{rendered}");
     assert!(rendered.contains("finish()"), "{rendered}");
+}
+
+#[test]
+fn keeps_an_uninstantiated_generic_definition_as_an_open_call_tree() {
+    let before = r#"
+        trait Store { fn save(&self); }
+        pub fn run<T: Store>(storage: T) { storage.save(); }
+    "#;
+    let after = r#"
+        trait Store { fn save(&self); }
+        pub fn run<T: Store>(storage: T) { validate(); storage.save(); }
+        fn validate() {}
+    "#;
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_plain(&report),
+        "rustdiff before.rs → after.rs\n\n  run<T: Store>(storage)\n+ ├─ validate()\n  └─ T::save()"
+    );
+}
+
+#[test]
+fn distinguishes_a_function_pointer_call_from_an_unresolved_name() {
+    let before = "pub fn run(callback: fn()) { callback(); }";
+    let after = "pub fn run(callback: fn()) { callback(); finish(); } fn finish() {}";
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+    assert!(rendered.contains("callback() [indirect]"), "{rendered}");
+    assert!(rendered.contains("finish()"), "{rendered}");
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.contains("indirect") && diagnostic.contains("function pointer")
+    }));
+}
+
+#[test]
+fn dyn_provenance_survives_a_standard_library_container() {
+    let before = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        impl Store for Postgres { fn save(&self) { write(); } }
+        fn write() {}
+        fn stores() -> Vec<Box<dyn Store>> {
+            let mut values: Vec<Box<dyn Store>> = Vec::new();
+            values.push(Box::new(Postgres));
+            values
+        }
+        pub fn run() { let values = stores(); values[0].save(); }
+    "#;
+    let after = before.replace("fn write() {}", "fn write() { commit(); } fn commit() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+    assert!(rendered.contains("Postgres::save()"), "{rendered}");
+    assert!(
+        !rendered.contains("dyn Store::save() [unresolved]"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("commit()"), "{rendered}");
+}
+
+#[test]
+fn max_depth_is_applied_after_a_deep_change_is_detected() {
+    let before = "pub fn root() { a(); } fn a() { b(); } fn b() { leaf(); } fn leaf() {}";
+    let after = "pub fn root() { a(); } fn a() { b(); } fn b() { leaf(); changed(); } fn leaf() {} fn changed() {}";
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["root".to_owned()],
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+    assert!(!rendered.contains("No rust call changes"), "{rendered}");
+    assert!(rendered.contains("… changed below max depth"), "{rendered}");
+}
+
+#[test]
+fn inserting_an_unrelated_closure_does_not_renumber_existing_closure_identity() {
+    let before = r#"
+        fn apply<F: Fn()>(f: F) { f(); }
+        fn old() {}
+        pub fn run() { apply(|| old()); }
+    "#;
+    let after = r#"
+        fn apply<F: Fn()>(f: F) { f(); }
+        fn apply_one<F: Fn(u8)>(f: F) { f(1); }
+        fn inserted() {}
+        fn old() {}
+        pub fn run() {
+            apply_one(|_| inserted());
+            apply(|| old());
+        }
+    "#;
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+    assert!(rendered.contains("  └─ apply<λ#2>()"), "{rendered}");
+    assert!(
+        !rendered.lines().any(|line| {
+            (line.starts_with("- ") || line.starts_with("+ ")) && line.contains("apply<λ#2>()")
+        }),
+        "{rendered}"
+    );
+    assert!(
+        !rendered
+            .lines()
+            .any(|line| line.starts_with("- ") && line.contains("old()")),
+        "{rendered}"
+    );
+
+    let analysis = diffkit::language::rust::analyze_semantic_source(after, &[]).unwrap();
+    assert!(
+        analysis
+            .functions
+            .iter()
+            .all(|function| !function.id.name.contains("{closure#"))
+    );
 }

@@ -344,19 +344,23 @@ mod tests {
     fn renders_dispatch_candidates_with_a_complete_double_line_relation() {
         let tree = CallNode {
             key: "rust://run".to_owned(),
+            callsite: None,
             label: CallLabel::new("run(store, order)"),
             relation: CallRelation::Call,
             children: vec![CallNode {
                 key: "rust://Store::save".to_owned(),
+                callsite: None,
                 label: CallLabel::new("dyn Store::save(order)"),
                 relation: CallRelation::Call,
                 children: vec![
                     CallNode {
                         key: "rust://Postgres::save".to_owned(),
+                        callsite: None,
                         label: CallLabel::new("Postgres::save(order)"),
                         relation: CallRelation::DispatchCandidate,
                         children: vec![CallNode {
                             key: "rust://sql::insert".to_owned(),
+                            callsite: None,
                             label: CallLabel::new("sql::insert(order)"),
                             relation: CallRelation::Call,
                             children: Vec::new(),
@@ -364,10 +368,12 @@ mod tests {
                     },
                     CallNode {
                         key: "rust://S3::save".to_owned(),
+                        callsite: None,
                         label: CallLabel::new("S3::save(order)"),
                         relation: CallRelation::DispatchCandidate,
                         children: vec![CallNode {
                             key: "rust://aws::put_object".to_owned(),
+                            callsite: None,
                             label: CallLabel::new("aws::put_object(order)"),
                             relation: CallRelation::Call,
                             children: Vec::new(),
@@ -394,14 +400,17 @@ mod tests {
     fn renders_recursive_calls_as_right_side_back_edges() {
         let tree = CallNode {
             key: "rust://a".to_owned(),
+            callsite: None,
             label: CallLabel::new("a()"),
             relation: CallRelation::Call,
             children: vec![CallNode {
                 key: "rust://b".to_owned(),
+                callsite: None,
                 label: CallLabel::new("b()"),
                 relation: CallRelation::Call,
                 children: vec![CallNode {
                     key: "rust://a".to_owned(),
+                    callsite: None,
                     label: CallLabel::new(""),
                     relation: CallRelation::BackEdge,
                     children: Vec::new(),
@@ -425,22 +434,26 @@ mod tests {
     fn keeps_partial_and_unresolved_dispatch_wording_distinct() {
         let tree = CallNode {
             key: "rust://run".to_owned(),
+            callsite: None,
             label: CallLabel::new("run(store)"),
             relation: CallRelation::Call,
             children: vec![
                 CallNode {
                     key: "rust://Store::save#partial".to_owned(),
+                    callsite: None,
                     label: CallLabel::new("dyn Store::save() [partial]"),
                     relation: CallRelation::Call,
                     children: vec![
                         CallNode {
                             key: "rust://Postgres::save".to_owned(),
+                            callsite: None,
                             label: CallLabel::new("Postgres::save()"),
                             relation: CallRelation::DispatchCandidate,
                             children: Vec::new(),
                         },
                         CallNode {
                             key: "rust://Store::save#unresolved".to_owned(),
+                            callsite: None,
                             label: CallLabel::new("… unresolved targets"),
                             relation: CallRelation::DispatchCandidate,
                             children: Vec::new(),
@@ -449,6 +462,7 @@ mod tests {
                 },
                 CallNode {
                     key: "rust://Store::load".to_owned(),
+                    callsite: None,
                     label: CallLabel::new("dyn Store::load() [unresolved]"),
                     relation: CallRelation::Call,
                     children: Vec::new(),

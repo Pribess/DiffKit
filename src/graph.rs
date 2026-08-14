@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use crate::model::{
     CallLabel, CallNode, CallRelation, CallSite, CallSyntax, CallTarget, DispatchCandidate,
@@ -8,9 +8,18 @@ use crate::model::{
 #[derive(Clone, Debug, Default)]
 pub struct ProgramGraph {
     functions: BTreeMap<SymbolId, FunctionInfo>,
+    functions_by_name: BTreeMap<(crate::model::LanguageId, String), BTreeSet<SymbolId>>,
     facts: Vec<LanguageFact>,
     source_files: BTreeSet<std::path::PathBuf>,
     declared_roots: BTreeSet<SymbolId>,
+}
+
+struct Expansion<'a> {
+    max_depth: usize,
+    file: Option<&'a std::path::Path>,
+    relevant: Option<&'a BTreeSet<SymbolId>>,
+    context: Option<&'a BTreeSet<SymbolId>>,
+    boundary_marker: Option<&'a str>,
 }
 
 impl ProgramGraph {
@@ -24,6 +33,11 @@ impl ProgramGraph {
                 if graph.functions.contains_key(&function.id) {
                     return Err(format!("duplicate symbol: {}", function.id));
                 }
+                graph
+                    .functions_by_name
+                    .entry((function.id.language.clone(), function.id.name.clone()))
+                    .or_default()
+                    .insert(function.id.clone());
                 graph.functions.insert(function.id.clone(), function);
             }
             graph.facts.extend(file.facts);
@@ -244,24 +258,31 @@ impl ProgramGraph {
     /// source function. Ordinary name ambiguity remains an error.
     pub fn resolve_entries(&self, entry: &str) -> Result<Vec<SymbolId>, String> {
         let normalized_entry = entry.replace('.', "::");
+        let match_generic_base = !normalized_entry.contains('<');
         let mut matches = self
             .functions
             .iter()
             .filter(|(id, function)| {
                 let qualified = id.qualified_parts().join("::");
-                let qualified_base = strip_context_suffix(&qualified);
-                let name_base = strip_context_suffix(&id.name);
+                let qualified_context_base = strip_context_suffix(&qualified);
+                let name_context_base = strip_context_suffix(&id.name);
                 let display = callable_prefix(&function.label.default);
                 id.to_string() == entry
                     || id.short_name() == entry
                     || id.name == entry
-                    || name_base == entry
                     || qualified == normalized_entry
-                    || qualified_base == normalized_entry
                     || qualified.ends_with(&format!("::{normalized_entry}"))
-                    || qualified_base.ends_with(&format!("::{normalized_entry}"))
                     || display == entry
                     || display == normalized_entry
+                    || (match_generic_base
+                        && [qualified_context_base, name_context_base, display]
+                            .into_iter()
+                            .flat_map(callable_aliases)
+                            .any(|alias| {
+                                alias == entry
+                                    || alias == normalized_entry
+                                    || alias.ends_with(&format!("::{normalized_entry}"))
+                            }))
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -308,14 +329,12 @@ impl ProgramGraph {
         let Some(first) = self.functions.get(first_symbol) else {
             return false;
         };
-        let first_key = strip_context_suffix(&first_symbol.name);
+        let first_display = strip_generic_arguments(callable_prefix(&first.label.default));
         remaining.iter().all(|symbol| {
             let Some(function) = self.functions.get(symbol) else {
                 return false;
             };
-            let key = strip_context_suffix(&symbol.name);
-            key == first_key
-                && function.label.default == first.label.default
+            strip_generic_arguments(callable_prefix(&function.label.default)) == first_display
                 && function.span == first.span
         })
     }
@@ -331,15 +350,155 @@ impl ProgramGraph {
         file: Option<&std::path::Path>,
     ) -> Option<CallNode> {
         self.functions.get(entry)?;
+        let expansion = Expansion {
+            max_depth,
+            file,
+            relevant: None,
+            context: None,
+            boundary_marker: None,
+        };
         Some(self.expand(
             entry,
             None,
             CallRelation::Call,
             0,
-            max_depth,
-            file,
+            &expansion,
             &mut HashSet::new(),
         ))
+    }
+
+    pub(crate) fn build_diff_call_tree(
+        &self,
+        entry: &SymbolId,
+        max_depth: usize,
+        file: Option<&std::path::Path>,
+        relevant: &BTreeSet<SymbolId>,
+        context: &BTreeSet<SymbolId>,
+        boundary_marker: &str,
+    ) -> Option<CallNode> {
+        self.functions.get(entry)?;
+        let expansion = Expansion {
+            max_depth,
+            file,
+            relevant: Some(relevant),
+            context: Some(context),
+            boundary_marker: Some(boundary_marker),
+        };
+        Some(self.expand(
+            entry,
+            None,
+            CallRelation::Call,
+            0,
+            &expansion,
+            &mut HashSet::new(),
+        ))
+    }
+
+    /// A function's local call shape, without expanding callees. Dynamic
+    /// dispatch candidates remain part of the shape because changing the
+    /// candidate set is itself a call-graph change.
+    pub(crate) fn local_call_shape(
+        &self,
+        symbol: &SymbolId,
+        file: Option<&std::path::Path>,
+    ) -> Option<CallNode> {
+        let function = self.functions.get(symbol)?;
+        let expansion = Expansion {
+            max_depth: 2,
+            file,
+            relevant: None,
+            context: None,
+            boundary_marker: None,
+        };
+        let mut visiting = HashSet::from([symbol.clone()]);
+        let children = function
+            .calls
+            .iter()
+            .map(|call| {
+                let dynamic = matches!(call.target, CallTarget::Dynamic { .. });
+                let mut node = self.expand_call(symbol, call, 1, &expansion, &mut visiting);
+                if !dynamic {
+                    node.children.clear();
+                } else {
+                    for candidate in &mut node.children {
+                        candidate.children.clear();
+                    }
+                }
+                node
+            })
+            .collect();
+        Some(CallNode {
+            key: symbol.to_string(),
+            callsite: None,
+            // Declaration labels are only visible when the function itself is
+            // selected as an entry. They must not propagate to every caller.
+            label: CallLabel::new(""),
+            relation: CallRelation::Call,
+            children,
+        })
+    }
+
+    /// Return every function in this graph that can reach one of `targets`.
+    /// This graph-level pass is linear in the call graph and avoids first
+    /// materializing a potentially exponential call tree.
+    pub(crate) fn symbols_reaching(
+        &self,
+        targets: &BTreeSet<SymbolId>,
+        file: Option<&std::path::Path>,
+    ) -> BTreeSet<SymbolId> {
+        let included = |symbol: &SymbolId| {
+            self.functions.get(symbol).is_some_and(|function| {
+                file.is_none_or(|file| same_file(&function.span.file, file))
+            })
+        };
+        let mut reverse = BTreeMap::<SymbolId, BTreeSet<SymbolId>>::new();
+        for (caller, function) in &self.functions {
+            if !included(caller) {
+                continue;
+            }
+            for call in &function.calls {
+                for target in self.call_targets(caller, call) {
+                    if included(&target) {
+                        reverse.entry(target).or_default().insert(caller.clone());
+                    }
+                }
+            }
+        }
+
+        let mut reaching = BTreeSet::new();
+        let mut pending = targets
+            .iter()
+            .filter(|target| included(target))
+            .cloned()
+            .collect::<VecDeque<_>>();
+        while let Some(symbol) = pending.pop_front() {
+            if !reaching.insert(symbol.clone()) {
+                continue;
+            }
+            if let Some(callers) = reverse.get(&symbol) {
+                pending.extend(callers.iter().cloned());
+            }
+        }
+        reaching
+    }
+
+    pub(crate) fn dispatch_context_symbols(
+        &self,
+        file: Option<&std::path::Path>,
+    ) -> BTreeSet<SymbolId> {
+        let dispatchers = self
+            .functions
+            .iter()
+            .filter(|(_, function)| {
+                file.is_none_or(|file| same_file(&function.span.file, file))
+                    && function
+                        .calls
+                        .iter()
+                        .any(|call| matches!(call.target, CallTarget::Dynamic { .. }))
+            })
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
+        self.symbols_reaching(&dispatchers, file)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -349,8 +508,7 @@ impl ProgramGraph {
         callsite_label: Option<&CallLabel>,
         relation: CallRelation,
         depth: usize,
-        max_depth: usize,
-        file: Option<&std::path::Path>,
+        expansion: &Expansion<'_>,
         visiting: &mut HashSet<SymbolId>,
     ) -> CallNode {
         let function = self
@@ -361,13 +519,29 @@ impl ProgramGraph {
             .cloned()
             .unwrap_or_else(|| function.label.clone());
 
-        if depth >= max_depth {
+        if depth >= expansion.max_depth {
+            let children = expansion
+                .boundary_marker
+                .filter(|_| {
+                    expansion
+                        .relevant
+                        .is_some_and(|relevant| relevant.contains(symbol))
+                })
+                .map(|marker| CallNode {
+                    key: format!("{symbol}#{marker}"),
+                    callsite: None,
+                    label: CallLabel::new(""),
+                    relation: CallRelation::Call,
+                    children: Vec::new(),
+                })
+                .into_iter()
+                .collect();
             return CallNode {
                 key: symbol.to_string(),
                 callsite: None,
                 label,
                 relation,
-                children: Vec::new(),
+                children,
             };
         }
 
@@ -384,7 +558,7 @@ impl ProgramGraph {
         let children = function
             .calls
             .iter()
-            .map(|call| self.expand_call(symbol, call, depth + 1, max_depth, file, visiting))
+            .map(|call| self.expand_call(symbol, call, depth + 1, expansion, visiting))
             .collect();
 
         visiting.remove(symbol);
@@ -402,8 +576,7 @@ impl ProgramGraph {
         caller: &SymbolId,
         call: &CallSite,
         depth: usize,
-        max_depth: usize,
-        file: Option<&std::path::Path>,
+        expansion: &Expansion<'_>,
         visiting: &mut HashSet<SymbolId>,
     ) -> CallNode {
         match &call.target {
@@ -419,8 +592,7 @@ impl ProgramGraph {
                     candidates,
                     *resolution,
                     depth,
-                    max_depth,
-                    file,
+                    expansion,
                     visiting,
                 );
                 node.callsite = Some(call.id.clone());
@@ -432,8 +604,7 @@ impl ProgramGraph {
                     &call.label,
                     CallRelation::Call,
                     depth,
-                    max_depth,
-                    file,
+                    expansion,
                     visiting,
                 );
                 node.callsite = Some(call.id.clone());
@@ -454,8 +625,7 @@ impl ProgramGraph {
                         &call.label,
                         CallRelation::Call,
                         depth,
-                        max_depth,
-                        file,
+                        expansion,
                         visiting,
                     );
                     node.callsite = Some(call.id.clone());
@@ -480,24 +650,21 @@ impl ProgramGraph {
         label: &CallLabel,
         relation: CallRelation,
         depth: usize,
-        max_depth: usize,
-        file: Option<&std::path::Path>,
+        expansion: &Expansion<'_>,
         visiting: &mut HashSet<SymbolId>,
     ) -> CallNode {
-        let can_expand = self
-            .functions
-            .get(&target)
-            .is_some_and(|function| file.is_none_or(|file| same_file(&function.span.file, file)));
+        let can_expand = self.functions.get(&target).is_some_and(|function| {
+            expansion
+                .file
+                .is_none_or(|file| same_file(&function.span.file, file))
+        }) && expansion.relevant.is_none_or(|relevant| {
+            relevant.contains(&target)
+                || expansion
+                    .context
+                    .is_some_and(|context| context.contains(&target))
+        });
         if can_expand {
-            self.expand(
-                &target,
-                Some(label),
-                relation,
-                depth,
-                max_depth,
-                file,
-                visiting,
-            )
+            self.expand(&target, Some(label), relation, depth, expansion, visiting)
         } else {
             CallNode {
                 key: target.to_string(),
@@ -517,37 +684,36 @@ impl ProgramGraph {
         candidates: &[DispatchCandidate],
         resolution: DispatchResolution,
         depth: usize,
-        max_depth: usize,
-        file: Option<&std::path::Path>,
+        expansion: &Expansion<'_>,
         visiting: &mut HashSet<SymbolId>,
     ) -> CallNode {
-        let children = if depth >= max_depth || resolution == DispatchResolution::Unresolved {
-            Vec::new()
-        } else {
-            candidates
-                .iter()
-                .map(|candidate| {
-                    self.expand_direct_call(
-                        candidate.target.clone(),
-                        &candidate.label,
-                        CallRelation::DispatchCandidate,
-                        depth + 1,
-                        max_depth,
-                        file,
-                        visiting,
+        let children =
+            if depth >= expansion.max_depth || resolution == DispatchResolution::Unresolved {
+                Vec::new()
+            } else {
+                candidates
+                    .iter()
+                    .map(|candidate| {
+                        self.expand_direct_call(
+                            candidate.target.clone(),
+                            &candidate.label,
+                            CallRelation::DispatchCandidate,
+                            depth + 1,
+                            expansion,
+                            visiting,
+                        )
+                    })
+                    .chain(
+                        (resolution == DispatchResolution::Partial).then(|| CallNode {
+                            key: format!("{dispatch}#unresolved"),
+                            callsite: None,
+                            label: CallLabel::new("… unresolved targets"),
+                            relation: CallRelation::DispatchCandidate,
+                            children: Vec::new(),
+                        }),
                     )
-                })
-                .chain(
-                    (resolution == DispatchResolution::Partial).then(|| CallNode {
-                        key: format!("{dispatch}#unresolved"),
-                        callsite: None,
-                        label: CallLabel::new("… unresolved targets"),
-                        relation: CallRelation::DispatchCandidate,
-                        children: Vec::new(),
-                    }),
-                )
-                .collect()
-        };
+                    .collect()
+            };
 
         let label = match resolution {
             DispatchResolution::Complete => label.clone(),
@@ -585,51 +751,49 @@ impl ProgramGraph {
         match call {
             CallSyntax::SelfMethod(method) => {
                 if let Some(container) = &caller.container {
-                    preferred.extend(self.functions.keys().filter(|candidate| {
-                        candidate.language == caller.language
-                            && candidate.module == caller.module
-                            && candidate.container.as_ref() == Some(container)
-                            && candidate.name == *method
-                    }));
+                    preferred.extend(self.named_symbols(&caller.language, method).filter(
+                        |candidate| {
+                            candidate.module == caller.module
+                                && candidate.container.as_ref() == Some(container)
+                        },
+                    ));
                 }
             }
             CallSyntax::Path(parts) if !parts.is_empty() => {
                 let name = parts.last().expect("non-empty path");
                 if parts.first().is_some_and(|part| part == "Self") {
                     if let Some(container) = &caller.container {
-                        preferred.extend(self.functions.keys().filter(|candidate| {
-                            candidate.language == caller.language
-                                && candidate.module == caller.module
-                                && candidate.container.as_ref() == Some(container)
-                                && candidate.name == *name
-                        }));
+                        preferred.extend(self.named_symbols(&caller.language, name).filter(
+                            |candidate| {
+                                candidate.module == caller.module
+                                    && candidate.container.as_ref() == Some(container)
+                            },
+                        ));
                     }
                 } else if parts.len() == 1 {
-                    preferred.extend(self.functions.keys().filter(|candidate| {
-                        candidate.language == caller.language
-                            && candidate.module == caller.module
-                            && candidate.container.is_none()
-                            && candidate.name == *name
-                    }));
+                    preferred.extend(self.named_symbols(&caller.language, name).filter(
+                        |candidate| {
+                            candidate.module == caller.module && candidate.container.is_none()
+                        },
+                    ));
                 } else {
-                    preferred.extend(self.functions.keys().filter(|candidate| {
-                        candidate.language == caller.language
-                            && candidate.name == *name
-                            && path_suffix_matches(candidate, parts)
-                    }));
+                    preferred.extend(
+                        self.named_symbols(&caller.language, name)
+                            .filter(|candidate| path_suffix_matches(candidate, parts)),
+                    );
                 }
             }
             CallSyntax::Method { receiver, method } => {
                 // Static-looking receiver names can be matched without type inference.
                 if receiver.chars().next().is_some_and(char::is_uppercase) {
-                    preferred.extend(self.functions.keys().filter(|candidate| {
-                        candidate.language == caller.language
-                            && candidate.name == *method
-                            && candidate
+                    preferred.extend(self.named_symbols(&caller.language, method).filter(
+                        |candidate| {
+                            candidate
                                 .container
                                 .as_deref()
                                 .is_some_and(|container| base_container(container) == receiver)
-                    }));
+                        },
+                    ));
                 }
             }
             CallSyntax::Path(_) => {}
@@ -647,11 +811,19 @@ impl ProgramGraph {
             CallSyntax::Path(parts) => parts.last()?,
             CallSyntax::SelfMethod(method) | CallSyntax::Method { method, .. } => method,
         };
-        let fallback =
-            unique(self.functions.keys().filter(|candidate| {
-                candidate.language == caller.language && candidate.name == *name
-            }));
+        let fallback = unique(self.named_symbols(&caller.language, name));
         (fallback.len() == 1).then(|| fallback[0].clone())
+    }
+
+    fn named_symbols<'a>(
+        &'a self,
+        language: &crate::model::LanguageId,
+        name: &str,
+    ) -> impl Iterator<Item = &'a SymbolId> {
+        self.functions_by_name
+            .get(&(language.clone(), name.to_owned()))
+            .into_iter()
+            .flatten()
     }
 }
 
@@ -701,6 +873,68 @@ fn callable_prefix(label: &str) -> &str {
 
 fn strip_context_suffix(value: &str) -> &str {
     value.split_once("#ctx[").map_or(value, |(base, _)| base)
+}
+
+fn strip_generic_arguments(value: &str) -> String {
+    let mut stripped = String::with_capacity(value.len());
+    let mut depth = 0usize;
+    for character in value.chars() {
+        match character {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => stripped.push(character),
+            _ => {}
+        }
+    }
+    stripped
+}
+
+fn callable_aliases(value: &str) -> Vec<String> {
+    if let Some((self_type, trait_name, method)) = qualified_trait_callable(value) {
+        let self_type = strip_generic_arguments(self_type);
+        let trait_name = strip_generic_arguments(trait_name);
+        let method = strip_generic_arguments(method);
+        return vec![
+            format!("{self_type} as {trait_name}::{method}"),
+            format!("{self_type}::{method}"),
+            format!("{trait_name}::{method}"),
+        ];
+    }
+    let callable = strip_generic_arguments(value);
+    let mut aliases = vec![callable.clone()];
+    if let Some((self_type, trait_method)) = callable.split_once(" as ")
+        && let Some((_, method)) = trait_method.rsplit_once("::")
+    {
+        aliases.push(format!("{self_type}::{method}"));
+        aliases.push(trait_method.to_owned());
+    }
+    aliases
+}
+
+fn qualified_trait_callable(value: &str) -> Option<(&str, &str, &str)> {
+    if !value.starts_with('<') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut qualification_end = None;
+    for (index, character) in value.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    qualification_end = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let qualification_end = qualification_end?;
+    let qualification = &value[1..qualification_end];
+    let method = value[qualification_end + 1..].strip_prefix("::")?;
+    let (self_type, trait_name) = qualification.rsplit_once(" as ")?;
+    Some((self_type, trait_name, method))
 }
 
 fn unique<'a>(values: impl IntoIterator<Item = &'a SymbolId>) -> Vec<&'a SymbolId> {

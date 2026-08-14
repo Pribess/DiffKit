@@ -430,6 +430,165 @@ fn git_mode_analyzes_standalone_ocaml_files_without_dune() {
 }
 
 #[test]
+fn git_mode_analyzes_code_behind_non_default_cargo_features() {
+    let repository = TestRepository::new();
+    repository.write(
+        "Cargo.toml",
+        "[package]\nname = \"feature-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[features]\ndefault = []\nbalance = []\n",
+    );
+    repository.write(
+        "src/lib.rs",
+        "#[cfg(feature = \"balance\")]\npub fn run() { save(); }\n#[cfg(feature = \"balance\")]\nfn save() {}\n",
+    );
+    repository.git(["init", "--quiet"]);
+    repository.git(["config", "user.email", "diffkit@example.invalid"]);
+    repository.git(["config", "user.name", "DiffKit Test"]);
+    repository.git(["add", "."]);
+    repository.git(["commit", "--quiet", "-m", "before"]);
+    repository.write(
+        "src/lib.rs",
+        "#[cfg(feature = \"balance\")]\npub fn run() { save(); audit(); }\n#[cfg(feature = \"balance\")]\nfn save() {}\n#[cfg(feature = \"balance\")]\nfn audit() {}\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args(["--color=plain", "--entry", "run"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("run()"), "{stdout}");
+    assert!(stdout.contains("audit()"), "{stdout}");
+}
+
+#[test]
+fn project_closure_contexts_stay_stable_when_source_lines_move() {
+    let repository = TestRepository::new();
+    repository.write(
+        "Cargo.toml",
+        "[package]\nname = \"closure-lines\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    repository.write(
+        "src/lib.rs",
+        "fn apply<F: FnOnce()>(f: F) { let invoke = || f(); invoke(); }\nfn work() {}\npub fn run() { apply(|| work()); }\n",
+    );
+    repository.git(["init", "--quiet"]);
+    repository.git(["config", "user.email", "diffkit@example.invalid"]);
+    repository.git(["config", "user.name", "DiffKit Test"]);
+    repository.git(["add", "."]);
+    repository.git(["commit", "--quiet", "-m", "before"]);
+    repository.write(
+        "src/lib.rs",
+        "// Moving a closure must not create a new monomorphization identity.\n\nfn apply<F: FnOnce()>(f: F) { let invoke = || f(); invoke(); }\nfn work() {}\npub fn run() { apply(|| work()); }\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args(["--color=plain"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("No call changes between HEAD and worktree."),
+        "{stdout}"
+    );
+
+    let tree = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args([
+            "file",
+            repository.path().join("src/lib.rs").to_str().unwrap(),
+            "--color=plain",
+            "--entry",
+            "run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        tree.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    let stdout = String::from_utf8(tree.stdout).unwrap();
+    assert!(stdout.contains("λinvoke<λ#1>"), "{stdout}");
+    assert!(!stdout.contains("{closure@"), "{stdout}");
+}
+
+#[test]
+fn macro_expanded_closure_contexts_stay_stable_when_source_lines_move() {
+    let repository = TestRepository::new();
+    repository.write(
+        "Cargo.toml",
+        "[package]\nname = \"macro-closure-lines\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    let source = r#"macro_rules! runner {
+    ($name:ident) => {
+        pub fn $name() { invoke(|| work()); }
+    };
+}
+
+fn invoke<F: FnOnce()>(f: F) { f(); }
+fn work() {}
+runner!(run);
+"#;
+    repository.write("src/lib.rs", source);
+    repository.git(["init", "--quiet"]);
+    repository.git(["config", "user.email", "diffkit@example.invalid"]);
+    repository.git(["config", "user.name", "DiffKit Test"]);
+    repository.git(["add", "."]);
+    repository.git(["commit", "--quiet", "-m", "before"]);
+    repository.write(
+        "src/lib.rs",
+        &format!("// Shift the macro's compiler span without changing calls.\n\n{source}"),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args(["--color=plain"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("No call changes between HEAD and worktree."),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("{closure@"), "{stdout}");
+
+    let tree = Command::new(env!("CARGO_BIN_EXE_diffkit"))
+        .args([
+            "file",
+            repository.path().join("src/lib.rs").to_str().unwrap(),
+            "--color=plain",
+            "--entry",
+            "invoke",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        tree.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    let stdout = String::from_utf8(tree.stdout).unwrap();
+    assert!(stdout.contains("invoke<λrun#1>"), "{stdout}");
+    assert!(!stdout.contains("{closure@"), "{stdout}");
+    assert!(!stdout.contains("{lambda-def:"), "{stdout}");
+}
+
+#[test]
 fn rust_context_crosses_a_workspace_crate_generic_body() {
     let repository = TestRepository::new();
     repository.write(

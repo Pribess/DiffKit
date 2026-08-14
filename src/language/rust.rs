@@ -17,7 +17,8 @@ use rustc_public::mir::{
     StatementKind, TerminatorKind,
 };
 use rustc_public::ty::{
-    AssocContainer, ExistentialTraitRef, RigidTy, TraitRef, Ty, TyKind, VtblEntry,
+    AssocContainer, Binder, ExistentialTraitRef, GenericArgKind, GenericArgs, RigidTy, TraitRef,
+    Ty, TyKind, VtblEntry,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,7 +47,7 @@ static TEMP_SOURCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RUSTC_CAPTURE_DIRECTORY: &str = "DIFFKIT_RUSTC_CAPTURE_DIRECTORY";
 const RUSTC_ANALYSIS_ROOT: &str = "DIFFKIT_RUSTC_ANALYSIS_ROOT";
 const SNAPSHOT_FINGERPRINT_FILE: &str = ".diffkit-snapshot-key";
-const RUST_SEMANTIC_CACHE_SCHEMA: u32 = 2;
+const RUST_SEMANTIC_CACHE_SCHEMA: u32 = 4;
 
 /// Analyze a standalone, compilable Rust source file with rustc's typed MIR.
 ///
@@ -210,7 +211,7 @@ fn capture_semantic_project(
     let fingerprint_started = std::time::Instant::now();
     let fingerprint = session
         .cache_path()
-        .map(|_| semantic_cache_fingerprint(root, wrapper_executable))
+        .map(|_| semantic_cache_fingerprint(root))
         .transpose()?;
     let fingerprint_elapsed = fingerprint_started.elapsed();
     // `cargo clean --workspace` and the following check form one operation.
@@ -247,7 +248,13 @@ fn capture_semantic_project(
         .into());
     }
     let output = Command::new("cargo")
-        .args(["check", "--workspace", "--all-targets", "--quiet"])
+        .args([
+            "check",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--quiet",
+        ])
         .current_dir(root)
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
         .env(RUSTC_CAPTURE_DIRECTORY, capture.results())
@@ -329,10 +336,10 @@ fn capture_semantic_project(
     Ok(analysis)
 }
 
-fn semantic_cache_fingerprint(root: &Path, wrapper_executable: &Path) -> std::io::Result<String> {
+fn semantic_cache_fingerprint(root: &Path) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     hash_cache_bytes(&mut hasher, &RUST_SEMANTIC_CACHE_SCHEMA.to_le_bytes());
-    hash_cache_bytes(&mut hasher, &analyzer_identity(wrapper_executable)?);
+    hash_cache_bytes(&mut hasher, &analyzer_identity());
     hash_command_identity(&mut hasher, root, "rustc", &["-vV"])?;
     hash_command_identity(&mut hasher, root, "cargo", &["-V"])?;
 
@@ -398,20 +405,15 @@ fn rust_build_environment_key(key: &std::ffi::OsStr) -> bool {
     .any(|prefix| key.starts_with(prefix))
 }
 
-fn analyzer_identity(wrapper_executable: &Path) -> std::io::Result<Vec<u8>> {
-    let metadata = wrapper_executable.metadata()?;
-    let modified = metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    Ok(format!(
-        "{}:{}:{}:{}",
-        env!("CARGO_PKG_VERSION"),
-        metadata.len(),
-        modified.as_secs(),
-        modified.subsec_nanos()
+fn analyzer_identity() -> Vec<u8> {
+    // Engine and renderer rebuilds do not change captured rustc facts. Cache
+    // compatibility is owned explicitly by the semantic schema so a local
+    // binary timestamp cannot invalidate every analyzed project.
+    format!(
+        "{}:semantic-schema-{RUST_SEMANTIC_CACHE_SCHEMA}",
+        env!("CARGO_PKG_VERSION")
     )
-    .into_bytes())
+    .into_bytes()
 }
 
 fn hash_command_identity(
@@ -1001,6 +1003,7 @@ struct SemanticFunction {
     base_key: String,
     key: String,
     display: String,
+    definition_name: String,
     body_span: SourceSpan,
     calls: Vec<SemanticCall>,
     constructor_spans: Vec<SourceSpan>,
@@ -1130,6 +1133,7 @@ impl ResolvedDynFlow {
 struct RawSemanticFunction {
     key: String,
     display: String,
+    definition_name: String,
     body_span: SourceSpan,
     calls: Vec<RawSemanticCall>,
     constructor_spans: Vec<SourceSpan>,
@@ -1266,7 +1270,7 @@ fn collect_instances() -> SemanticProgram {
     for item in &instance_bodies {
         let instance = item.instance;
         let body = &item.body;
-        let instance_name = instance.name();
+        let instance_name = stable_instance_name(instance);
         let analysis = analyze_body_dyn_flows(body, &return_summaries, &local_instances);
         let mut calls = Vec::new();
         for (block_index, block) in body.blocks.iter().enumerate() {
@@ -1285,7 +1289,7 @@ fn collect_instances() -> SemanticProgram {
                 .unwrap_or_default();
             let target = match resolved_target {
                 Some(target) => {
-                    let name = target.name();
+                    let name = stable_instance_name(target);
                     match target.kind {
                         InstanceKind::Virtual { .. } => RawSemanticCallTarget::Dynamic {
                             dispatch: target,
@@ -1361,6 +1365,7 @@ fn collect_instances() -> SemanticProgram {
         raw_functions.push(RawSemanticFunction {
             key: normalize_instance_key(&instance_name),
             display: normalize_instance_display(&instance_name, &crate_name),
+            definition_name: instance.def.name().to_string(),
             body_span: rustc_source_span(body.span),
             calls,
             constructor_spans,
@@ -1516,6 +1521,13 @@ fn collect_observed_vtables(body: &rustc_public::mir::Body, observed: &mut Vec<T
             let Some((concrete_ty, principal)) = dyn_coercion(source_ty, *target_ty) else {
                 continue;
             };
+            // `TraitRef` cannot represent the binder around a higher-ranked
+            // principal such as `dyn for<'a> Fn(&'a T)`. Flattening it would
+            // pass escaping bound variables to rustc's vtable query and panic.
+            if !principal.bound_vars.is_empty() {
+                continue;
+            }
+            let principal = principal.value;
             let trait_ref = TraitRef::new(principal.def_id, concrete_ty, &principal.generic_args);
             if !observed.contains(&trait_ref) {
                 observed.push(trait_ref);
@@ -1524,13 +1536,13 @@ fn collect_observed_vtables(body: &rustc_public::mir::Body, observed: &mut Vec<T
     }
 }
 
-fn dyn_coercion(source: Ty, target: Ty) -> Option<(Ty, ExistentialTraitRef)> {
+fn dyn_coercion(source: Ty, target: Ty) -> Option<(Ty, Binder<ExistentialTraitRef>)> {
     let target_kind = target.kind();
     if let Some(principal) = target_kind.trait_principal() {
         // A trait upcast (`dyn Child` -> `dyn Parent`) does not reveal a
         // concrete implementation. Only thin-to-wide coercions contribute an
         // concrete receiver-flow candidate here.
-        return (!source.kind().is_trait()).then_some((source, principal.value));
+        return (!source.kind().is_trait()).then_some((source, principal));
     }
 
     match (source.kind(), target_kind) {
@@ -1893,12 +1905,15 @@ fn dyn_flow_for_rvalue(body: &Body, state: &DynState, value: &Rvalue) -> DynFlow
                 .ty(body.locals())
                 .ok()
                 .and_then(|source_ty| dyn_coercion(source_ty, *target_ty))
-                .map(|(concrete_ty, principal)| {
-                    DynFlow::concrete(TraitRef::new(
-                        principal.def_id,
-                        concrete_ty,
-                        &principal.generic_args,
-                    ))
+                .and_then(|(concrete_ty, principal)| {
+                    principal.bound_vars.is_empty().then(|| {
+                        let principal = principal.value;
+                        DynFlow::concrete(TraitRef::new(
+                            principal.def_id,
+                            concrete_ty,
+                            &principal.generic_args,
+                        ))
+                    })
                 })
                 .unwrap_or_else(|| dyn_flow_for_operand(body, state, operand))
         }
@@ -2195,8 +2210,8 @@ fn specialize_semantic_functions(
                         ) else {
                             continue;
                         };
-                        if let Some(target) = index.get(&normalize_instance_key(&candidate.name()))
-                        {
+                        let candidate_name = stable_instance_name(candidate);
+                        if let Some(target) = index.get(&normalize_instance_key(&candidate_name)) {
                             incoming[*target] += 1;
                         }
                     }
@@ -2266,7 +2281,7 @@ fn specialize_semantic_functions(
                             ) else {
                                 continue;
                             };
-                            let candidate_name = candidate.name();
+                            let candidate_name = stable_instance_name(candidate);
                             let raw_candidate_key = normalize_instance_key(&candidate_name);
                             let candidate_key = index.get(&raw_candidate_key).map_or_else(
                                 || raw_candidate_key.clone(),
@@ -2332,6 +2347,7 @@ fn specialize_semantic_functions(
                 base_key: raw.key.clone(),
                 key: function_key,
                 display: raw.display.clone(),
+                definition_name: raw.definition_name.clone(),
                 body_span: raw.body_span.clone(),
                 calls,
                 constructor_spans: raw.constructor_spans.clone(),
@@ -3188,9 +3204,15 @@ fn canonicalize_semantic_closures(
             ),
         })
         .collect::<Vec<_>>();
-    if closures.is_empty() {
-        return;
-    }
+    let compiler_sources = semantic
+        .functions
+        .iter()
+        .filter_map(|function| {
+            let source = closure_for_body_span(&function.body_span, &closures, file_identities)?;
+            let marker = compiler_closure_marker(&function.definition_name)?;
+            Some((marker, (source.identity.clone(), source.lambda.clone())))
+        })
+        .collect::<HashMap<_, _>>();
 
     let mut direct_closures = HashMap::<String, (String, String)>::new();
     for function in &semantic.functions {
@@ -3198,14 +3220,21 @@ fn canonicalize_semantic_closures(
         else {
             continue;
         };
-        let located_key = rewrite_located_closures(
+        let located_key = canonicalize_closure_value(
             &function.key,
             &closures,
             file_identities,
             ClosureRewrite::Identity,
+            &compiler_sources,
         );
         let key = replace_closure_definition(&located_key, &source.identity);
-        let display = closure_instance_display(&source.lambda, &function.display);
+        let display = canonicalize_closure_value(
+            &closure_instance_display(&source.lambda, &function.display),
+            &closures,
+            file_identities,
+            ClosureRewrite::Display,
+            &compiler_sources,
+        );
         direct_closures.insert(function.key.clone(), (key, display));
     }
 
@@ -3215,34 +3244,38 @@ fn canonicalize_semantic_closures(
             function.key = key.clone();
             function.display = display.clone();
         } else {
-            function.key = rewrite_located_closures(
+            function.key = canonicalize_closure_value(
                 &function.key,
                 &closures,
                 file_identities,
                 ClosureRewrite::Identity,
+                &compiler_sources,
             );
-            function.display = rewrite_located_closures(
+            function.display = canonicalize_closure_value(
                 &function.display,
                 &closures,
                 file_identities,
                 ClosureRewrite::Display,
+                &compiler_sources,
             );
         }
         for parameter in &mut function.parameter_types {
-            *parameter = rewrite_located_closures(
+            *parameter = canonicalize_closure_value(
                 parameter,
                 &closures,
                 file_identities,
                 ClosureRewrite::Display,
+                &compiler_sources,
             );
         }
         for call in &mut function.calls {
             for argument in &mut call.argument_types {
-                *argument = rewrite_located_closures(
+                *argument = canonicalize_closure_value(
                     argument,
                     &closures,
                     file_identities,
                     ClosureRewrite::Display,
+                    &compiler_sources,
                 );
             }
             match &mut call.target {
@@ -3253,6 +3286,7 @@ fn canonicalize_semantic_closures(
                         &direct_closures,
                         &closures,
                         file_identities,
+                        &compiler_sources,
                     );
                 }
                 SemanticCallTarget::Dynamic {
@@ -3267,6 +3301,7 @@ fn canonicalize_semantic_closures(
                         &direct_closures,
                         &closures,
                         file_identities,
+                        &compiler_sources,
                     );
                     for candidate in candidates {
                         rewrite_closure_target(
@@ -3275,6 +3310,7 @@ fn canonicalize_semantic_closures(
                             &direct_closures,
                             &closures,
                             file_identities,
+                            &compiler_sources,
                         );
                     }
                 }
@@ -3295,15 +3331,70 @@ fn rewrite_closure_target(
     direct_closures: &HashMap<String, (String, String)>,
     closures: &[SemanticClosureSource],
     file_identities: &HashMap<PathBuf, PathBuf>,
+    compiler_sources: &HashMap<String, (String, String)>,
 ) {
     if let Some((canonical_key, canonical_display)) = direct_closures.get(key) {
         *key = canonical_key.clone();
         *display = canonical_display.clone();
         return;
     }
-    *key = rewrite_located_closures(key, closures, file_identities, ClosureRewrite::Identity);
-    *display =
-        rewrite_located_closures(display, closures, file_identities, ClosureRewrite::Display);
+    *key = canonicalize_closure_value(
+        key,
+        closures,
+        file_identities,
+        ClosureRewrite::Identity,
+        compiler_sources,
+    );
+    *display = canonicalize_closure_value(
+        display,
+        closures,
+        file_identities,
+        ClosureRewrite::Display,
+        compiler_sources,
+    );
+}
+
+fn canonicalize_closure_value(
+    value: &str,
+    closures: &[SemanticClosureSource],
+    file_identities: &HashMap<PathBuf, PathBuf>,
+    rewrite: ClosureRewrite,
+    compiler_sources: &HashMap<String, (String, String)>,
+) -> String {
+    let mut value = rewrite_located_closures(value, closures, file_identities, rewrite);
+    for (marker, (identity, display)) in compiler_sources {
+        value = value.replace(
+            marker,
+            match rewrite {
+                ClosureRewrite::Identity => identity,
+                ClosureRewrite::Display => display,
+            },
+        );
+    }
+    match rewrite {
+        ClosureRewrite::Identity => value,
+        ClosureRewrite::Display => render_compiler_closure_markers(&value),
+    }
+}
+
+fn render_compiler_closure_markers(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remainder = value;
+    while let Some(start) = remainder.find("{lambda-def:") {
+        output.push_str(&remainder[..start]);
+        let marker = &remainder[start..];
+        let Some(end) = marker.find('}') else {
+            output.push_str(marker);
+            return output;
+        };
+        let label = marker[..end]
+            .rsplit_once(':')
+            .map_or(&marker[..=end], |(_, label)| label);
+        output.push_str(label);
+        remainder = &marker[end + 1..];
+    }
+    output.push_str(remainder);
+    output
 }
 
 fn closure_for_body_span<'a>(
@@ -3378,14 +3469,22 @@ fn closure_for_location<'a>(
     closures: &'a [SemanticClosureSource],
     file_identities: &HashMap<PathBuf, PathBuf>,
 ) -> Option<&'a SemanticClosureSource> {
-    closures
+    let candidates = closures
         .iter()
         .filter(|closure| {
-            source_file_identity(file_identities, &closure.span.file)
-                == source_file_identity(file_identities, file)
+            source_paths_match(file_identities, &closure.span.file, file)
                 && closure.span.start_line == line
         })
-        .min_by_key(|closure| closure.span.start_column.saturating_add(1).abs_diff(column))
+        .collect::<Vec<_>>();
+    let best_distance = candidates
+        .iter()
+        .map(|closure| closure.span.start_column.saturating_add(1).abs_diff(column))
+        .min()?;
+    let mut best = candidates.into_iter().filter(|closure| {
+        closure.span.start_column.saturating_add(1).abs_diff(column) == best_distance
+    });
+    let closure = best.next()?;
+    best.next().is_none().then_some(closure)
 }
 
 fn replace_closure_definition(value: &str, replacement: &str) -> String {
@@ -3448,6 +3547,14 @@ fn source_file_identities(
 
 fn source_file_identity<'a>(identities: &'a HashMap<PathBuf, PathBuf>, path: &'a Path) -> &'a Path {
     identities.get(path).map_or(path, PathBuf::as_path)
+}
+
+fn source_paths_match(identities: &HashMap<PathBuf, PathBuf>, left: &Path, right: &Path) -> bool {
+    let left = source_file_identity(identities, left);
+    let right = source_file_identity(identities, right);
+    left == right
+        || (left.is_absolute() && !right.is_absolute() && left.ends_with(right))
+        || (right.is_absolute() && !left.is_absolute() && right.ends_with(left))
 }
 
 fn best_function_template<'a>(
@@ -3521,6 +3628,107 @@ fn semantic_symbol(name: String) -> SymbolId {
         container: None,
         name,
     }
+}
+
+fn stable_instance_name(instance: Instance) -> String {
+    let name = instance.name().to_string();
+    let mut replacements = BTreeMap::<String, Option<String>>::new();
+    collect_compiler_closure_replacements(&instance.args(), &mut replacements);
+    replacements
+        .into_iter()
+        .filter_map(|(located, marker)| marker.map(|marker| (located, marker)))
+        .fold(name, |name, (located, marker)| {
+            name.replace(&located, &marker)
+        })
+}
+
+fn collect_compiler_closure_replacements(
+    arguments: &GenericArgs,
+    replacements: &mut BTreeMap<String, Option<String>>,
+) {
+    for argument in &arguments.0 {
+        if let GenericArgKind::Type(ty) = argument {
+            collect_direct_closure_replacement(*ty, replacements);
+        }
+    }
+}
+
+fn collect_direct_closure_replacement(ty: Ty, replacements: &mut BTreeMap<String, Option<String>>) {
+    // `rustc_public` still has unimplemented conversions for aliases and
+    // coroutine closures. Inspecting every nested `TyKind` can therefore panic
+    // on otherwise valid crates (Rayon contains such aliases). Ordinary
+    // closures passed as function generics are direct arguments here, so only
+    // open that known-safe shape.
+    let rendered = ty.to_string();
+    if !rendered.starts_with("{closure@") {
+        return;
+    }
+    let TyKind::RigidTy(RigidTy::Closure(definition, _)) = ty.kind() else {
+        return;
+    };
+    record_compiler_closure(&rendered, &definition.name().to_string(), replacements);
+}
+
+fn record_compiler_closure(
+    rendered: &str,
+    definition_name: &str,
+    replacements: &mut BTreeMap<String, Option<String>>,
+) {
+    let Some(located) = located_closure_token(rendered) else {
+        return;
+    };
+    let Some(marker) = compiler_closure_marker(definition_name) else {
+        return;
+    };
+    replacements
+        .entry(located.to_owned())
+        .and_modify(|current| {
+            if current.as_deref() != Some(&marker) {
+                *current = None;
+            }
+        })
+        .or_insert(Some(marker));
+}
+
+fn located_closure_token(value: &str) -> Option<&str> {
+    let start = ["{closure@", "{async closure@"]
+        .into_iter()
+        .filter_map(|prefix| value.find(prefix))
+        .min()?;
+    let end = value[start..].find('}')? + start;
+    Some(&value[start..=end])
+}
+
+fn compiler_closure_marker(definition_name: &str) -> Option<String> {
+    let label = compiler_closure_label(definition_name)?;
+    let mut hasher = Sha256::new();
+    hasher.update(definition_name.as_bytes());
+    let identity = format!("{:x}", hasher.finalize());
+    Some(format!("{{lambda-def:{}:{label}}}", &identity[..12]))
+}
+
+fn compiler_closure_label(definition_name: &str) -> Option<String> {
+    let (parent, ordinal) = ["::{closure#", "::{async closure#"]
+        .into_iter()
+        .find_map(|separator| definition_name.rsplit_once(separator))?;
+    let ordinal = ordinal.strip_suffix('}')?.parse::<usize>().ok()? + 1;
+    let parent = parent.rsplit("::").next().unwrap_or("closure");
+    let parent = parent
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let parent = if parent.trim_matches('_').is_empty() {
+        "closure"
+    } else {
+        parent.trim_matches('_')
+    };
+    Some(format!("λ{parent}#{ordinal}"))
 }
 
 fn normalize_instance_key(name: &str) -> String {
@@ -3612,16 +3820,15 @@ fn semantic_callee(source: &str, semantic: &str) -> String {
         );
     }
 
-    let generic_arguments = semantic
-        .find('<')
-        .zip(semantic.rfind('>'))
-        .filter(|(start, end)| start < end)
-        .map(|(start, end)| simplify_type_paths(&semantic[start..=end]));
-    if let Some(generic_arguments) = generic_arguments {
-        let source_base = source
-            .find('<')
-            .map_or(source, |generic_start| &source[..generic_start]);
-        return format!("{source_base}{generic_arguments}");
+    if semantic.contains('<') {
+        let source_segments = split_top_level_path(source);
+        let semantic_segments = split_top_level_path(semantic);
+        let keep = source_segments.len().min(semantic_segments.len()).max(1);
+        return semantic_segments[semantic_segments.len().saturating_sub(keep)..]
+            .iter()
+            .map(|segment| simplify_type_paths(segment))
+            .collect::<Vec<_>>()
+            .join("::");
     }
 
     let parts = semantic.split("::").collect::<Vec<_>>();
@@ -3634,6 +3841,29 @@ fn semantic_callee(source: &str, semantic: &str) -> String {
         return format!("{}::{}", parts[parts.len() - 2], parts[parts.len() - 1]);
     }
     source.to_owned()
+}
+
+fn split_top_level_path(value: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && bytes.get(index + 1) == Some(&b':') => {
+                segments.push(&value[start..index]);
+                index += 1;
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    segments.push(&value[start..]);
+    segments
 }
 
 fn simplify_type_paths(value: &str) -> String {
@@ -3667,7 +3897,8 @@ fn normalize_type_display(value: &str, crate_name: &str) -> String {
 fn semantic_call_argument_types(call: &SemanticCall) -> Vec<String> {
     let is_closure = matches!(
         &call.target,
-        SemanticCallTarget::Direct { display, .. } if display.contains("{closure#")
+        SemanticCallTarget::Direct { display, .. }
+            if display.starts_with('λ') || display.contains("{closure#")
     );
     if !is_closure {
         return call.argument_types.clone();
@@ -5005,6 +5236,72 @@ mod tests {
     }
 
     #[test]
+    fn rustc_public_skips_higher_ranked_vtables() {
+        let directory = std::env::temp_dir().join(format!(
+            "diffkit-rustc-public-bound-vtable-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("input.rs");
+        fs::write(
+            &path,
+            r#"
+                use std::{
+                    any::{Any, TypeId},
+                    collections::HashMap,
+                    sync::Arc,
+                };
+
+                pub fn populate() {
+                    let mut values: HashMap<TypeId, Arc<dyn Any + Send + Sync>> = HashMap::new();
+                    values.insert(TypeId::of::<u8>(), Arc::new(1_u8));
+                    values.reserve(1);
+                }
+            "#,
+        )
+        .unwrap();
+
+        let analysis = analyze_semantic_file(&path).unwrap();
+
+        assert!(
+            analysis
+                .functions
+                .iter()
+                .any(|function| function.label.default.starts_with("populate("))
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rustc_public_does_not_open_opaque_instance_arguments() {
+        let directory = std::env::temp_dir().join(format!(
+            "diffkit-rustc-public-opaque-argument-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("input.rs");
+        fs::write(
+            &path,
+            r#"
+                fn make() -> impl Copy { 1_u8 }
+                fn consume<T: Copy>(_value: T) {}
+                pub fn run() { consume(make()); }
+            "#,
+        )
+        .unwrap();
+
+        let analysis = analyze_semantic_file(&path).unwrap();
+
+        assert!(
+            analysis
+                .functions
+                .iter()
+                .any(|function| function.label.default.starts_with("run("))
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn semantic_analysis_omits_enum_variant_constructors() {
         let directory = std::env::temp_dir().join(format!(
             "diffkit-rustc-public-constructors-{}",
@@ -5183,6 +5480,7 @@ mod tests {
         let function = || RawSemanticFunction {
             key: "crate::duplicate".to_owned(),
             display: "duplicate".to_owned(),
+            definition_name: "crate::duplicate".to_owned(),
             body_span: span.clone(),
             calls: Vec::new(),
             constructor_spans: Vec::new(),

@@ -75,6 +75,18 @@ fn mark_tree(node: &CallNode, status: DiffStatus) -> DiffNode {
 fn diff_children(before: &[CallNode], after: &[CallNode]) -> Vec<DiffNode> {
     let n = before.len();
     let m = after.len();
+    if n == m
+        && before
+            .iter()
+            .zip(after)
+            .all(|(before, after)| nodes_equivalent(before, after))
+    {
+        return before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| diff_node(Some(before), Some(after)))
+            .collect();
+    }
     let mut score = vec![vec![0usize; m + 1]; n + 1];
 
     for i in (0..n).rev() {
@@ -112,6 +124,18 @@ fn diff_children(before: &[CallNode], after: &[CallNode]) -> Vec<DiffNode> {
         j += 1;
     }
     result
+}
+
+fn nodes_equivalent(before: &CallNode, after: &CallNode) -> bool {
+    before.key == after.key
+        && labels_equivalent(&before.label.default, &after.label.default)
+        && before.relation == after.relation
+        && before.children.len() == after.children.len()
+        && before
+            .children
+            .iter()
+            .zip(&after.children)
+            .all(|(before, after)| nodes_equivalent(before, after))
 }
 
 /// Prefer stable call-site identity and unchanged source labels while still

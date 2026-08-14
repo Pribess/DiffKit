@@ -409,19 +409,14 @@ fn build_file_report(
             .into_iter()
             .collect()
     };
-    let trees = candidate_entries
-        .into_iter()
-        .filter_map(|entry| {
-            let before_tree = before.build_call_tree_in_file(&entry, usize::MAX, Some(before_path));
-            let after_tree = after.build_call_tree_in_file(&entry, usize::MAX, Some(after_path));
-            let mut tree = diff_optional(before_tree.as_ref(), after_tree.as_ref())?;
-            tree_has_changes(&tree).then(|| {
-                collapse_unchanged_subtrees(&mut tree);
-                truncate_diff_tree(&mut tree, options.max_depth);
-                EntryDiff { entry, tree }
-            })
-        })
-        .collect();
+    let trees = changed_entries_in_files(
+        before,
+        after,
+        candidate_entries,
+        options.max_depth,
+        Some(before_path),
+        Some(after_path),
+    );
     let mut report = report_from_trees(
         language,
         before_path.display().to_string(),
@@ -635,17 +630,82 @@ fn changed_entries(
     entries: impl IntoIterator<Item = SymbolId>,
     max_depth: usize,
 ) -> Vec<EntryDiff> {
+    changed_entries_in_files(before, after, entries, max_depth, None, None)
+}
+
+fn changed_entries_in_files(
+    before: &ProgramGraph,
+    after: &ProgramGraph,
+    entries: impl IntoIterator<Item = SymbolId>,
+    max_depth: usize,
+    before_file: Option<&Path>,
+    after_file: Option<&Path>,
+) -> Vec<EntryDiff> {
+    let local_changes = locally_changed_symbols(before, after, before_file, after_file);
+    let before_relevant = before.symbols_reaching(&local_changes, before_file);
+    let after_relevant = after.symbols_reaching(&local_changes, after_file);
+    let before_context = before.dispatch_context_symbols(before_file);
+    let after_context = after.dispatch_context_symbols(after_file);
+    let expansion_depth = max_depth.saturating_add(1);
+
     entries
         .into_iter()
         .filter_map(|entry| {
-            let before_tree = before.build_call_tree(&entry, usize::MAX);
-            let after_tree = after.build_call_tree(&entry, usize::MAX);
+            let before_root = before.build_call_tree_in_file(&entry, 0, before_file);
+            let after_root = after.build_call_tree_in_file(&entry, 0, after_file);
+            let root_changed = diff_optional(before_root.as_ref(), after_root.as_ref())
+                .is_some_and(|tree| tree_has_changes(&tree));
+            if !root_changed
+                && !before_relevant.contains(&entry)
+                && !after_relevant.contains(&entry)
+            {
+                return None;
+            }
+
+            let before_tree = before.build_diff_call_tree(
+                &entry,
+                expansion_depth,
+                before_file,
+                &before_relevant,
+                &before_context,
+                "diffkit-before-boundary",
+            );
+            let after_tree = after.build_diff_call_tree(
+                &entry,
+                expansion_depth,
+                after_file,
+                &after_relevant,
+                &after_context,
+                "diffkit-after-boundary",
+            );
             let mut tree = diff_optional(before_tree.as_ref(), after_tree.as_ref())?;
             tree_has_changes(&tree).then(|| {
                 collapse_unchanged_subtrees(&mut tree);
                 truncate_diff_tree(&mut tree, max_depth);
                 EntryDiff { entry, tree }
             })
+        })
+        .collect()
+}
+
+fn locally_changed_symbols(
+    before: &ProgramGraph,
+    after: &ProgramGraph,
+    before_file: Option<&Path>,
+    after_file: Option<&Path>,
+) -> BTreeSet<SymbolId> {
+    before
+        .functions()
+        .keys()
+        .chain(after.functions().keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|symbol| {
+            let before_shape = before.local_call_shape(symbol, before_file);
+            let after_shape = after.local_call_shape(symbol, after_file);
+            diff_optional(before_shape.as_ref(), after_shape.as_ref())
+                .is_some_and(|tree| tree_has_changes(&tree))
         })
         .collect()
 }
@@ -957,10 +1017,134 @@ fn module_path(root: &Path, file: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        CallLabel, CallSite, CallSiteId, CallSyntax, CallTarget, FileAnalysis, FunctionInfo,
+        LanguageId, SourceSpan,
+    };
 
     #[test]
     fn cargo_test_targets_are_project_sources() {
         let test = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli.rs");
         assert!(rust_file_is_project_source(&test));
+    }
+
+    #[test]
+    fn deep_shared_dag_is_diffed_without_materializing_an_exponential_tree() {
+        let before = shared_dag_graph(false);
+        let after = shared_dag_graph(true);
+        let trees = changed_entries(&before, &after, [test_symbol("f0")], 2);
+
+        assert_eq!(trees.len(), 1);
+        assert!(diff_node_count(&trees[0].tree) < 50);
+        assert!(diff_has_label(&trees[0].tree, "… changed below max depth"));
+    }
+
+    #[test]
+    fn unresolved_edges_are_indexed_in_large_unchanged_graphs() {
+        let graph = unresolved_graph(4_000);
+        let trees = changed_entries(&graph, &graph, [test_symbol("f0")], 2);
+        assert!(trees.is_empty());
+    }
+
+    fn shared_dag_graph(changed: bool) -> ProgramGraph {
+        const LEVELS: usize = 35;
+        let mut functions = (0..=LEVELS)
+            .map(|level| {
+                let name = format!("f{level}");
+                let calls = if level < LEVELS {
+                    (0..2)
+                        .map(|occurrence| test_call(&name, occurrence, &format!("f{}", level + 1)))
+                        .collect()
+                } else if changed {
+                    vec![test_call(&name, 0, "audit")]
+                } else {
+                    Vec::new()
+                };
+                test_function(&name, level + 1, calls)
+            })
+            .collect::<Vec<_>>();
+        functions.push(test_function("audit", LEVELS + 2, Vec::new()));
+        ProgramGraph::from_files([FileAnalysis {
+            functions,
+            ..FileAnalysis::default()
+        }])
+        .unwrap()
+    }
+
+    fn unresolved_graph(size: usize) -> ProgramGraph {
+        let functions = (0..size)
+            .map(|index| {
+                let name = format!("f{index}");
+                test_function(
+                    &name,
+                    index + 1,
+                    vec![CallSite {
+                        id: CallSiteId(format!("{name}:external")),
+                        syntax: CallSyntax::Path(vec!["external".to_owned()]),
+                        target: CallTarget::Unresolved,
+                        label: CallLabel::new("external()"),
+                        span: test_span(index + 1),
+                    }],
+                )
+            })
+            .collect();
+        ProgramGraph::from_files([FileAnalysis {
+            functions,
+            ..FileAnalysis::default()
+        }])
+        .unwrap()
+    }
+
+    fn test_symbol(name: &str) -> SymbolId {
+        SymbolId {
+            language: LanguageId::new("rust"),
+            module: Vec::new(),
+            container: None,
+            name: name.to_owned(),
+        }
+    }
+
+    fn test_function(name: &str, line: usize, calls: Vec<CallSite>) -> FunctionInfo {
+        FunctionInfo {
+            id: test_symbol(name),
+            label: CallLabel::new(format!("{name}()")),
+            public: false,
+            calls,
+            span: test_span(line),
+        }
+    }
+
+    fn test_call(caller: &str, occurrence: usize, target: &str) -> CallSite {
+        CallSite {
+            id: CallSiteId(format!("{caller}:{occurrence}")),
+            syntax: CallSyntax::Path(vec![target.to_owned()]),
+            target: CallTarget::Direct(test_symbol(target)),
+            label: CallLabel::new(format!("{target}()")),
+            span: test_span(occurrence + 1),
+        }
+    }
+
+    fn test_span(line: usize) -> crate::model::SourceSpan {
+        SourceSpan {
+            file: PathBuf::from("fixture.rs"),
+            start_line: line,
+            start_column: 0,
+            start_byte: None,
+            end_line: line,
+            end_column: 1,
+            end_byte: None,
+        }
+    }
+
+    fn diff_node_count(node: &DiffNode) -> usize {
+        1 + node.children.iter().map(diff_node_count).sum::<usize>()
+    }
+
+    fn diff_has_label(node: &DiffNode, label: &str) -> bool {
+        node.label.default == label
+            || node
+                .children
+                .iter()
+                .any(|child| diff_has_label(child, label))
     }
 }

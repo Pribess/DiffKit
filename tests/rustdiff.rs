@@ -147,6 +147,73 @@ fn keeps_generic_arguments_on_rust_callsite_labels() {
 }
 
 #[test]
+fn bare_entry_resolves_every_closure_monomorphization_of_one_generic_method() {
+    let before = r#"
+        struct Walker;
+        impl Walker {
+            fn run<F: FnOnce()>(self, visit: F) { visit(); }
+        }
+        fn left() {}
+        fn right() {}
+        pub fn entry() {
+            Walker.run(|| left());
+            Walker.run(|| right());
+        }
+    "#;
+    let after = before.replace("fn left() {}", "fn left() { changed(); } fn changed() {}");
+
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            // Real crates such as ripgrep expose one rustc instance per
+            // closure type. A source-level entry selects all of them.
+            entries: vec!["Walker::run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    let rendered = render_plain(&report);
+    assert!(rendered.contains("Walker::run<λ#"), "{rendered}");
+    assert!(rendered.contains("left()"), "{rendered}");
+    assert!(rendered.contains("changed()"), "{rendered}");
+    assert!(!rendered.contains("right()"), "{rendered}");
+}
+
+#[test]
+fn generic_impl_entry_can_omit_container_and_method_arguments() {
+    let before = r#"
+        trait Access { fn visit<V>(&self, value: V); }
+        struct Variant<T>(T);
+        impl<T> Access for Variant<T> {
+            fn visit<V>(&self, _value: V) { work(); }
+        }
+        fn work() {}
+        pub fn entry() { Variant(1_u8).visit(2_u16); }
+    "#;
+    let after = before.replace("fn work() {}", "fn work() { finish(); } fn finish() {}");
+
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["Variant::visit".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    let rendered = render_plain(&report);
+    assert!(rendered.contains("Variant<u8>::visit<u16>"), "{rendered}");
+    assert!(rendered.contains("finish()"), "{rendered}");
+}
+
+#[test]
 fn rust_analysis_uses_concrete_generic_and_trait_targets() {
     let report = rustdiff_sources(
         "before.rs",

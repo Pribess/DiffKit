@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use crate::model::{
     CallLabel, CallNode, CallRelation, CallSite, CallSyntax, CallTarget, DispatchCandidate,
@@ -8,15 +9,43 @@ use crate::model::{
 #[derive(Clone, Debug, Default)]
 pub struct ProgramGraph {
     functions: BTreeMap<SymbolId, FunctionInfo>,
-    functions_by_name: BTreeMap<(crate::model::LanguageId, String), BTreeSet<SymbolId>>,
+    index: GraphIndex,
     facts: Vec<LanguageFact>,
-    source_files: BTreeSet<std::path::PathBuf>,
+    source_files: BTreeSet<PathBuf>,
     declared_roots: BTreeSet<SymbolId>,
+}
+
+/// Immutable lookup data derived from `functions` once at graph construction.
+/// Language frontends only emit facts; traversal never needs to rebuild these
+/// relationships or repeat syntax fallback resolution.
+#[derive(Clone, Debug, Default)]
+struct GraphIndex {
+    functions_by_name: BTreeMap<crate::model::LanguageId, BTreeMap<String, BTreeSet<SymbolId>>>,
+    functions_by_file: BTreeMap<PathBuf, BTreeSet<SymbolId>>,
+    analyzed_files: BTreeSet<PathBuf>,
+    outgoing: BTreeMap<SymbolId, BTreeSet<SymbolId>>,
+    incoming: BTreeMap<SymbolId, BTreeSet<SymbolId>>,
+    expand_call: BTreeMap<SymbolId, Vec<bool>>,
+}
+
+#[derive(Clone, Copy)]
+enum FileScope<'a> {
+    All,
+    Only(Option<&'a BTreeSet<SymbolId>>),
+}
+
+impl FileScope<'_> {
+    fn contains(self, symbol: &SymbolId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(symbols) => symbols.is_some_and(|symbols| symbols.contains(symbol)),
+        }
+    }
 }
 
 struct Expansion<'a> {
     max_depth: usize,
-    file: Option<&'a std::path::Path>,
+    file: FileScope<'a>,
     relevant: Option<&'a BTreeSet<SymbolId>>,
     context: Option<&'a BTreeSet<SymbolId>>,
     boundary_marker: Option<&'a str>,
@@ -41,24 +70,117 @@ impl ProgramGraph {
                 if graph.functions.contains_key(&function.id) {
                     return Err(format!("duplicate symbol: {}", function.id));
                 }
-                let mut index_names = BTreeSet::from([function.id.name.clone()]);
-                if let Some(leaf) = function.id.name.rsplit("::").next()
-                    && leaf != function.id.name
-                {
-                    index_names.insert(leaf.to_owned());
-                }
-                for name in index_names {
-                    graph
-                        .functions_by_name
-                        .entry((function.id.language.clone(), name))
-                        .or_default()
-                        .insert(function.id.clone());
-                }
                 graph.functions.insert(function.id.clone(), function);
             }
             graph.facts.extend(file.facts);
         }
+        graph.index_definitions();
+        graph.resolve_fallback_calls();
+        graph.index_calls();
         Ok(graph)
+    }
+
+    fn index_definitions(&mut self) {
+        let mut index = GraphIndex::default();
+        index
+            .analyzed_files
+            .extend(self.source_files.iter().cloned());
+        for function in self.functions.values() {
+            let mut names = BTreeSet::from([function.id.name.clone()]);
+            if let Some(leaf) = function.id.name.rsplit("::").next()
+                && leaf != function.id.name
+            {
+                names.insert(leaf.to_owned());
+            }
+            for name in names {
+                index
+                    .functions_by_name
+                    .entry(function.id.language.clone())
+                    .or_default()
+                    .entry(name)
+                    .or_default()
+                    .insert(function.id.clone());
+            }
+            index
+                .functions_by_file
+                .entry(function.span.file.clone())
+                .or_default()
+                .insert(function.id.clone());
+            index.analyzed_files.insert(function.span.file.clone());
+        }
+        let canonical_function_files = index
+            .functions_by_file
+            .iter()
+            .filter_map(|(file, symbols)| {
+                let canonical = file.canonicalize().ok()?;
+                (canonical != *file).then(|| (canonical, symbols.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (file, symbols) in canonical_function_files {
+            index
+                .functions_by_file
+                .entry(file)
+                .or_default()
+                .extend(symbols);
+        }
+        let canonical_analyzed_files = index
+            .analyzed_files
+            .iter()
+            .filter_map(|file| file.canonicalize().ok())
+            .collect::<Vec<_>>();
+        index.analyzed_files.extend(canonical_analyzed_files);
+        self.index = index;
+    }
+
+    fn resolve_fallback_calls(&mut self) {
+        let mut resolutions = Vec::new();
+        for (caller, function) in &self.functions {
+            for (call, site) in function.calls.iter().enumerate() {
+                if matches!(site.target, CallTarget::Unresolved)
+                    && let Some(target) = self.resolve_call(caller, &site.syntax)
+                {
+                    resolutions.push((caller.clone(), call, target));
+                }
+            }
+        }
+        for (caller, call, target) in resolutions {
+            if let Some(site) = self
+                .functions
+                .get_mut(&caller)
+                .and_then(|function| function.calls.get_mut(call))
+            {
+                site.target = CallTarget::Direct(target);
+            }
+        }
+    }
+
+    fn index_calls(&mut self) {
+        for (caller, function) in &self.functions {
+            let mut last = BTreeMap::<CallExpansionKey, usize>::new();
+            let mut expand = vec![true; function.calls.len()];
+            for (call_index, call) in function.calls.iter().enumerate() {
+                for target in call_targets(call) {
+                    if self.functions.contains_key(target) {
+                        self.index
+                            .outgoing
+                            .entry(caller.clone())
+                            .or_default()
+                            .insert(target.clone());
+                        self.index
+                            .incoming
+                            .entry(target.clone())
+                            .or_default()
+                            .insert(caller.clone());
+                    }
+                }
+                if let Some(key) = call_expansion_key(call)
+                    && let Some(previous) = last.insert(key, call_index)
+                {
+                    expand[previous] = false;
+                }
+            }
+            self.index.expand_call.insert(caller.clone(), expand);
+        }
     }
 
     pub fn functions(&self) -> &BTreeMap<SymbolId, FunctionInfo> {
@@ -121,20 +243,20 @@ impl ProgramGraph {
         diagnostics.into_iter().collect()
     }
 
-    pub fn source_files(&self) -> BTreeSet<std::path::PathBuf> {
+    pub fn source_files(&self) -> BTreeSet<PathBuf> {
         self.source_files.clone()
     }
 
-    pub fn analyzes_file(&self, file: &std::path::Path) -> bool {
-        self.source_files
-            .iter()
-            .any(|analyzed| same_file(analyzed, file))
+    pub fn analyzes_file(&self, file: &Path) -> bool {
+        self.index.analyzed_files.contains(file)
+            || file
+                .canonicalize()
+                .is_ok_and(|file| self.index.analyzed_files.contains(&file))
     }
 
-    pub fn has_functions_in_file(&self, file: &std::path::Path) -> bool {
-        self.functions
-            .values()
-            .any(|function| same_file(&function.span.file, file))
+    pub fn has_functions_in_file(&self, file: &Path) -> bool {
+        self.symbols_in_file(file)
+            .is_some_and(|symbols| !symbols.is_empty())
     }
 
     pub fn public_symbols(&self) -> BTreeSet<SymbolId> {
@@ -158,32 +280,15 @@ impl ProgramGraph {
                 .cloned()
                 .collect();
         }
-        let mut incoming = self
+        let natural = self
             .functions
             .keys()
+            .filter(|symbol| !self.index.incoming.contains_key(*symbol))
             .cloned()
-            .map(|symbol| (symbol, 0usize))
-            .collect::<BTreeMap<_, _>>();
-        let mut adjacency = BTreeMap::<SymbolId, BTreeSet<SymbolId>>::new();
-
-        for (caller, function) in &self.functions {
-            for call in &function.calls {
-                for target in self.call_targets(caller, call) {
-                    if self.functions.contains_key(&target) {
-                        *incoming.entry(target.clone()).or_default() += 1;
-                        adjacency.entry(caller.clone()).or_default().insert(target);
-                    }
-                }
-            }
-        }
-
-        let natural = incoming
-            .iter()
-            .filter_map(|(symbol, count)| (*count == 0).then_some(symbol.clone()))
             .collect::<BTreeSet<_>>();
         let mut covered = BTreeSet::new();
         for root in &natural {
-            mark_reachable(root, &adjacency, &mut covered);
+            mark_reachable(root, &self.index.outgoing, &mut covered, FileScope::All);
         }
 
         let mut roots = natural;
@@ -202,54 +307,43 @@ impl ProgramGraph {
             .map(|function| function.id.clone())
         {
             roots.insert(uncovered.clone());
-            mark_reachable(&uncovered, &adjacency, &mut covered);
+            mark_reachable(
+                &uncovered,
+                &self.index.outgoing,
+                &mut covered,
+                FileScope::All,
+            );
         }
         roots
     }
 
-    pub fn roots_in_file(&self, file: &std::path::Path) -> BTreeSet<SymbolId> {
-        let functions = self
-            .functions
-            .values()
-            .filter(|function| same_file(&function.span.file, file))
-            .map(|function| function.id.clone())
-            .collect::<BTreeSet<_>>();
+    pub fn roots_in_file(&self, file: &Path) -> BTreeSet<SymbolId> {
+        let Some(functions) = self.symbols_in_file(file) else {
+            return BTreeSet::new();
+        };
         if functions.is_empty() {
             return BTreeSet::new();
         }
 
-        let mut incoming = functions
-            .iter()
-            .cloned()
-            .map(|symbol| (symbol, 0usize))
-            .collect::<BTreeMap<_, _>>();
-        let mut adjacency = BTreeMap::<SymbolId, BTreeSet<SymbolId>>::new();
-        for caller in &functions {
-            let Some(function) = self.functions.get(caller) else {
-                continue;
-            };
-            for call in &function.calls {
-                for target in self.call_targets(caller, call) {
-                    if functions.contains(&target) {
-                        *incoming.entry(target.clone()).or_default() += 1;
-                        adjacency.entry(caller.clone()).or_default().insert(target);
-                    }
-                }
-            }
-        }
-
-        let natural = incoming
-            .iter()
-            .filter_map(|(symbol, count)| (*count == 0).then_some(symbol.clone()))
-            .collect::<BTreeSet<_>>();
+        let natural =
+            functions
+                .iter()
+                .filter(|symbol| {
+                    !self.index.incoming.get(*symbol).is_some_and(|callers| {
+                        callers.iter().any(|caller| functions.contains(caller))
+                    })
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+        let scope = FileScope::Only(Some(functions));
         let mut covered = BTreeSet::new();
         for root in &natural {
-            mark_reachable(root, &adjacency, &mut covered);
+            mark_reachable(root, &self.index.outgoing, &mut covered, scope);
         }
         let mut roots = natural;
         while let Some(uncovered) = functions.iter().find(|symbol| !covered.contains(*symbol)) {
             roots.insert(uncovered.clone());
-            mark_reachable(uncovered, &adjacency, &mut covered);
+            mark_reachable(uncovered, &self.index.outgoing, &mut covered, scope);
         }
         roots
     }
@@ -336,16 +430,13 @@ impl ProgramGraph {
     pub fn resolve_entries_in_file(
         &self,
         entry: &str,
-        file: &std::path::Path,
+        file: &Path,
     ) -> Result<Vec<SymbolId>, String> {
         let matches = self.resolve_entries(entry)?;
+        let scope = self.file_scope(Some(file));
         Ok(matches
             .into_iter()
-            .filter(|symbol| {
-                self.functions
-                    .get(symbol)
-                    .is_some_and(|function| same_file(&function.span.file, file))
-            })
+            .filter(|symbol| scope.contains(symbol))
             .collect())
     }
 
@@ -374,12 +465,12 @@ impl ProgramGraph {
         &self,
         entry: &SymbolId,
         max_depth: usize,
-        file: Option<&std::path::Path>,
+        file: Option<&Path>,
     ) -> Option<CallNode> {
         self.functions.get(entry)?;
         let expansion = Expansion {
             max_depth,
-            file,
+            file: self.file_scope(file),
             relevant: None,
             context: None,
             boundary_marker: None,
@@ -398,7 +489,7 @@ impl ProgramGraph {
         &self,
         entry: &SymbolId,
         max_depth: usize,
-        file: Option<&std::path::Path>,
+        file: Option<&Path>,
         relevant: &BTreeSet<SymbolId>,
         context: &BTreeSet<SymbolId>,
         boundary_marker: &str,
@@ -406,7 +497,7 @@ impl ProgramGraph {
         self.functions.get(entry)?;
         let expansion = Expansion {
             max_depth,
-            file,
+            file: self.file_scope(file),
             relevant: Some(relevant),
             context: Some(context),
             boundary_marker: Some(boundary_marker),
@@ -427,12 +518,12 @@ impl ProgramGraph {
     pub(crate) fn local_call_shape(
         &self,
         symbol: &SymbolId,
-        file: Option<&std::path::Path>,
+        file: Option<&Path>,
     ) -> Option<CallNode> {
         let function = self.functions.get(symbol)?;
         let expansion = Expansion {
             max_depth: 2,
-            file,
+            file: self.file_scope(file),
             relevant: None,
             context: None,
             boundary_marker: None,
@@ -471,53 +562,39 @@ impl ProgramGraph {
     pub(crate) fn symbols_reaching(
         &self,
         targets: &BTreeSet<SymbolId>,
-        file: Option<&std::path::Path>,
+        file: Option<&Path>,
     ) -> BTreeSet<SymbolId> {
-        let included = |symbol: &SymbolId| {
-            self.functions.get(symbol).is_some_and(|function| {
-                file.is_none_or(|file| same_file(&function.span.file, file))
-            })
-        };
-        let mut reverse = BTreeMap::<SymbolId, BTreeSet<SymbolId>>::new();
-        for (caller, function) in &self.functions {
-            if !included(caller) {
-                continue;
-            }
-            for call in &function.calls {
-                for target in self.call_targets(caller, call) {
-                    if included(&target) {
-                        reverse.entry(target).or_default().insert(caller.clone());
-                    }
-                }
-            }
-        }
+        let scope = self.file_scope(file);
 
         let mut reaching = BTreeSet::new();
         let mut pending = targets
             .iter()
-            .filter(|target| included(target))
+            .filter(|target| scope.contains(target))
             .cloned()
             .collect::<VecDeque<_>>();
         while let Some(symbol) = pending.pop_front() {
             if !reaching.insert(symbol.clone()) {
                 continue;
             }
-            if let Some(callers) = reverse.get(&symbol) {
-                pending.extend(callers.iter().cloned());
+            if let Some(callers) = self.index.incoming.get(&symbol) {
+                pending.extend(
+                    callers
+                        .iter()
+                        .filter(|caller| scope.contains(caller))
+                        .cloned(),
+                );
             }
         }
         reaching
     }
 
-    pub(crate) fn dispatch_context_symbols(
-        &self,
-        file: Option<&std::path::Path>,
-    ) -> BTreeSet<SymbolId> {
+    pub(crate) fn dispatch_context_symbols(&self, file: Option<&Path>) -> BTreeSet<SymbolId> {
+        let scope = self.file_scope(file);
         let dispatchers = self
             .functions
             .iter()
-            .filter(|(_, function)| {
-                file.is_none_or(|file| same_file(&function.span.file, file))
+            .filter(|(symbol, function)| {
+                scope.contains(symbol)
                     && function
                         .calls
                         .iter()
@@ -582,23 +659,16 @@ impl ProgramGraph {
             };
         }
 
-        let last_expansions = function
-            .calls
-            .iter()
-            .enumerate()
-            .filter_map(|(index, call)| {
-                self.call_expansion_key(symbol, call)
-                    .map(|key| (key, index))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let expand_calls = self.index.expand_call.get(symbol);
         let children = function
             .calls
             .iter()
             .enumerate()
             .map(|(index, call)| {
-                let expand_target = self
-                    .call_expansion_key(symbol, call)
-                    .is_none_or(|key| last_expansions.get(&key) == Some(&index));
+                let expand_target = expand_calls
+                    .and_then(|calls| calls.get(index))
+                    .copied()
+                    .unwrap_or(true);
                 self.expand_call(symbol, call, depth + 1, expansion, expand_target, visiting)
             })
             .collect();
@@ -700,16 +770,14 @@ impl ProgramGraph {
         expand_target: bool,
         visiting: &mut HashSet<SymbolId>,
     ) -> CallNode {
-        let can_expand = self.functions.get(&target).is_some_and(|function| {
-            expansion
-                .file
-                .is_none_or(|file| same_file(&function.span.file, file))
-        }) && expansion.relevant.is_none_or(|relevant| {
-            relevant.contains(&target)
-                || expansion
-                    .context
-                    .is_some_and(|context| context.contains(&target))
-        });
+        let can_expand = self.functions.contains_key(&target)
+            && expansion.file.contains(&target)
+            && expansion.relevant.is_none_or(|relevant| {
+                relevant.contains(&target)
+                    || expansion
+                        .context
+                        .is_some_and(|context| context.contains(&target))
+            });
         if can_expand && expand_target {
             self.expand(&target, Some(label), relation, depth, expansion, visiting)
         } else {
@@ -778,44 +846,6 @@ impl ProgramGraph {
             label,
             relation: CallRelation::Call,
             children,
-        }
-    }
-
-    fn call_targets(&self, caller: &SymbolId, call: &CallSite) -> Vec<SymbolId> {
-        match &call.target {
-            CallTarget::Direct(target) => vec![target.clone()],
-            CallTarget::Dynamic { candidates, .. } => candidates
-                .iter()
-                .map(|candidate| candidate.target.clone())
-                .collect(),
-            CallTarget::Indirect { .. } => Vec::new(),
-            CallTarget::Unresolved => self
-                .resolve_call(caller, &call.syntax)
-                .into_iter()
-                .collect(),
-        }
-    }
-
-    fn call_expansion_key(&self, caller: &SymbolId, call: &CallSite) -> Option<CallExpansionKey> {
-        match &call.target {
-            CallTarget::Direct(target) => Some(CallExpansionKey::Direct(target.clone())),
-            CallTarget::Unresolved => self
-                .resolve_call(caller, &call.syntax)
-                .map(CallExpansionKey::Direct),
-            CallTarget::Dynamic {
-                dispatch,
-                candidates,
-                resolution,
-                ..
-            } => Some(CallExpansionKey::Dynamic(
-                dispatch.clone(),
-                candidates
-                    .iter()
-                    .map(|candidate| candidate.target.clone())
-                    .collect(),
-                *resolution,
-            )),
-            CallTarget::Indirect { .. } => None,
         }
     }
 
@@ -891,10 +921,27 @@ impl ProgramGraph {
         language: &crate::model::LanguageId,
         name: &str,
     ) -> impl Iterator<Item = &'a SymbolId> {
-        self.functions_by_name
-            .get(&(language.clone(), name.to_owned()))
+        self.index
+            .functions_by_name
+            .get(language)
+            .and_then(|names| names.get(name))
             .into_iter()
             .flatten()
+    }
+
+    fn symbols_in_file(&self, file: &Path) -> Option<&BTreeSet<SymbolId>> {
+        self.index.functions_by_file.get(file).or_else(|| {
+            file.canonicalize()
+                .ok()
+                .and_then(|file| self.index.functions_by_file.get(&file))
+        })
+    }
+
+    fn file_scope(&self, file: Option<&Path>) -> FileScope<'_> {
+        match file {
+            Some(file) => FileScope::Only(self.symbols_in_file(file)),
+            None => FileScope::All,
+        }
     }
 }
 
@@ -902,24 +949,51 @@ fn mark_reachable(
     root: &SymbolId,
     adjacency: &BTreeMap<SymbolId, BTreeSet<SymbolId>>,
     covered: &mut BTreeSet<SymbolId>,
+    scope: FileScope<'_>,
 ) {
-    if !covered.insert(root.clone()) {
-        return;
-    }
-    if let Some(targets) = adjacency.get(root) {
-        for target in targets {
-            mark_reachable(target, adjacency, covered);
+    let mut pending = vec![root.clone()];
+    while let Some(symbol) = pending.pop() {
+        if !scope.contains(&symbol) || !covered.insert(symbol.clone()) {
+            continue;
+        }
+        if let Some(targets) = adjacency.get(&symbol) {
+            pending.extend(targets.iter().rev().cloned());
         }
     }
 }
 
-fn same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
-    left == right
-        || left
-            .canonicalize()
-            .ok()
-            .zip(right.canonicalize().ok())
-            .is_some_and(|(left, right)| left == right)
+fn call_targets(call: &CallSite) -> impl Iterator<Item = &SymbolId> {
+    let direct = match &call.target {
+        CallTarget::Direct(target) => Some(target),
+        _ => None,
+    };
+    let dynamic = match &call.target {
+        CallTarget::Dynamic { candidates, .. } => candidates.as_slice(),
+        _ => &[],
+    };
+    direct
+        .into_iter()
+        .chain(dynamic.iter().map(|candidate| &candidate.target))
+}
+
+fn call_expansion_key(call: &CallSite) -> Option<CallExpansionKey> {
+    match &call.target {
+        CallTarget::Direct(target) => Some(CallExpansionKey::Direct(target.clone())),
+        CallTarget::Dynamic {
+            dispatch,
+            candidates,
+            resolution,
+            ..
+        } => Some(CallExpansionKey::Dynamic(
+            dispatch.clone(),
+            candidates
+                .iter()
+                .map(|candidate| candidate.target.clone())
+                .collect(),
+            *resolution,
+        )),
+        CallTarget::Indirect { .. } | CallTarget::Unresolved => None,
+    }
 }
 
 fn callable_prefix(label: &str) -> &str {

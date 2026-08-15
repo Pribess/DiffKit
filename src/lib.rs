@@ -12,6 +12,7 @@ pub mod graph;
 pub mod language;
 pub mod model;
 pub mod render;
+mod source;
 
 pub type DiffkitResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::DiffkitResult;
+use crate::source::contains_generated_component;
 
 static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const SNAPSHOT_FINGERPRINT_FILE: &str = ".diffkit-snapshot-key";
@@ -463,12 +464,7 @@ fn copy_directory(source: &Path, destination: &Path, root: &Path) -> DiffkitResu
 }
 
 fn should_skip(relative: &Path) -> bool {
-    relative.components().any(|component| {
-        matches!(
-            component.as_os_str().to_str(),
-            Some(".git" | "target" | "_build" | "node_modules" | ".zig-cache" | "zig-out")
-        )
-    })
+    contains_generated_component(relative)
 }
 
 fn git_output<'a>(

@@ -1,10 +1,10 @@
 #![feature(rustc_private)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitCode};
+use std::process::ExitCode;
 
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::{Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -287,8 +287,8 @@ fn run_git(
             report.before = endpoint_project_label(before.label(), &relative_root);
             report.after = endpoint_project_label(after.label(), &relative_root);
             covered.extend(relevant_paths.iter().filter_map(|path| {
-                (report_analyzes_path(&report, &before.path().join(path))
-                    || report_analyzes_path(&report, &after.path().join(path)))
+                (report.analyzes_path(&before.path().join(path))
+                    || report.analyzes_path(&after.path().join(path)))
                 .then_some(path.clone())
             }));
             if verbose {
@@ -432,33 +432,26 @@ fn is_ocaml_project_trigger(path: &Path) -> bool {
         || path.extension().and_then(|extension| extension.to_str()) == Some("opam")
 }
 
-fn report_analyzes_path(report: &diffkit::DiffReport, path: &Path) -> bool {
-    report.analyzed_files.iter().any(|analyzed| {
-        analyzed == path
-            || analyzed
-                .canonicalize()
-                .ok()
-                .zip(path.canonicalize().ok())
-                .is_some_and(|(analyzed, path)| analyzed == path)
-    })
-}
-
 fn changed_cargo_roots(
     before_snapshot: &Path,
     after_snapshot: &Path,
     paths: &[PathBuf],
 ) -> BTreeSet<PathBuf> {
     let mut roots = BTreeSet::new();
+    let mut workspace_roots = HashMap::new();
     for relative in paths {
         for snapshot in [before_snapshot, after_snapshot] {
             let Some(root) = nearest_cargo_root(snapshot, relative) else {
                 continue;
             };
-            let workspace = cargo_workspace_root(&root).unwrap_or(root);
-            let relative_root = relative_snapshot_path(snapshot, &workspace).or_else(|| {
-                nearest_cargo_root(snapshot, relative)
-                    .and_then(|root| relative_snapshot_path(snapshot, &root))
-            });
+            let workspace = workspace_roots
+                .entry(root.clone())
+                .or_insert_with(|| {
+                    diffkit::engine::cargo_workspace_root(&root).unwrap_or_else(|| root.clone())
+                })
+                .clone();
+            let relative_root = relative_snapshot_path(snapshot, &workspace)
+                .or_else(|| relative_snapshot_path(snapshot, &root));
             if let Some(relative_root) = relative_root {
                 roots.insert(relative_root);
             }
@@ -512,19 +505,6 @@ fn nearest_project_marker(snapshot: &Path, relative: &Path, marker: &str) -> Opt
         }
         cursor = cursor.parent()?.to_path_buf();
     }
-}
-
-fn cargo_workspace_root(directory: &Path) -> Option<PathBuf> {
-    let output = ProcessCommand::new("cargo")
-        .args(["locate-project", "--workspace", "--message-format", "plain"])
-        .current_dir(directory)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let manifest = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
-    manifest.parent().map(Path::to_path_buf)
 }
 
 fn find_ancestor_marker(path: &Path, marker: &str) -> Option<PathBuf> {

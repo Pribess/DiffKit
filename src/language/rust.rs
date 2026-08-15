@@ -18,7 +18,7 @@ use rustc_public::mir::{
 };
 use rustc_public::ty::{
     AssocContainer, Binder, ConstantKind, ExistentialTraitRef, FnDef, GenericArgKind, GenericArgs,
-    RigidTy, TraitRef, Ty, TyKind, UintTy, VtblEntry,
+    ImplDef, RigidTy, TraitRef, Ty, TyKind, UintTy, VtblEntry,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,6 +38,9 @@ use crate::model::{
     DispatchResolution, FileAnalysis, FunctionInfo, LanguageFact, LanguageId, SourceSpan, SymbolId,
     UnresolvedReason,
 };
+use crate::source::{
+    collect_source_files, contains_generated_component, is_generated_directory, paths_match,
+};
 
 #[derive(Default)]
 pub struct RustBackend;
@@ -49,7 +52,7 @@ static TEMP_SOURCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RUSTC_CAPTURE_DIRECTORY: &str = "DIFFKIT_RUSTC_CAPTURE_DIRECTORY";
 const RUSTC_ANALYSIS_ROOT: &str = "DIFFKIT_RUSTC_ANALYSIS_ROOT";
 const SNAPSHOT_FINGERPRINT_FILE: &str = ".diffkit-snapshot-key";
-const RUST_SEMANTIC_CACHE_SCHEMA: u32 = 8;
+const RUST_SEMANTIC_CACHE_SCHEMA: u32 = 9;
 
 /// Analyze a standalone, compilable Rust source file with rustc's typed MIR.
 ///
@@ -258,14 +261,19 @@ fn capture_semantic_project(
         })
         .into());
     }
-    let output = Command::new("cargo")
-        .args([
-            "check",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--quiet",
-        ])
+    let mut check = Command::new("cargo");
+    check.args([
+        "check",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--quiet",
+    ]);
+    let cargo_jobs = session.cargo_jobs.map(|jobs| jobs.to_string());
+    if let Some(jobs) = &cargo_jobs {
+        check.args(["--jobs", jobs]);
+    }
+    let output = check
         .current_dir(root)
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
         .env(RUSTC_CAPTURE_DIRECTORY, capture.results())
@@ -329,13 +337,14 @@ fn capture_semantic_project(
     let syntax = analyze_project_sources(root)?;
     let analysis = deduplicate_analysis(merge_semantic_program(syntax, semantic));
     if let (Some(cache_path), Some(fingerprint)) = (session.cache_path(), fingerprint) {
-        let cache = CachedRustAnalysis {
+        let mut cache = CachedRustAnalysis {
             schema: RUST_SEMANTIC_CACHE_SCHEMA,
             fingerprint,
-            root: root.to_path_buf(),
             analysis,
         };
+        relativize_analysis_root(&mut cache.analysis, root);
         let _ = write_analysis_cache(cache_path, &cache);
+        materialize_analysis_root(&mut cache.analysis, root);
         session.report_cache(
             false,
             &cache.fingerprint,
@@ -477,13 +486,6 @@ fn hash_project_inputs(root: &Path, directory: &Path, hasher: &mut Sha256) -> st
     Ok(())
 }
 
-fn is_generated_directory(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".git" | "target" | "node_modules" | ".zig-cache" | "zig-out" | "_build")
-    )
-}
-
 fn hash_file_contents(path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
     let mut file = fs::File::open(path)?;
     let length = file.metadata()?.len();
@@ -509,7 +511,7 @@ fn read_analysis_cache(path: PathBuf, fingerprint: &str, root: &Path) -> Option<
     if cached.schema != RUST_SEMANTIC_CACHE_SCHEMA || cached.fingerprint != fingerprint {
         return None;
     }
-    remap_analysis_root(&mut cached.analysis, &cached.root, root);
+    materialize_analysis_root(&mut cached.analysis, root);
     Some(cached.analysis)
 }
 
@@ -570,6 +572,7 @@ pub(crate) struct RustProjectSession {
     cleanup: Option<PathBuf>,
     endpoint: Option<String>,
     verbose: bool,
+    cargo_jobs: Option<usize>,
 }
 
 impl RustProjectSession {
@@ -585,6 +588,7 @@ impl RustProjectSession {
             cleanup: Some(directory),
             endpoint: None,
             verbose: false,
+            cargo_jobs: None,
         })
     }
 
@@ -612,7 +616,14 @@ impl RustProjectSession {
             cleanup: None,
             endpoint: Some(endpoint.to_owned()),
             verbose,
+            cargo_jobs: None,
         })
+    }
+
+    pub(crate) fn limit_cargo_jobs(&mut self, jobs: usize) {
+        if env::var_os("CARGO_BUILD_JOBS").is_none() {
+            self.cargo_jobs = Some(jobs.max(1));
+        }
     }
 
     fn target(&self) -> &Path {
@@ -692,12 +703,7 @@ fn copy_rust_project(
     for entry in entries {
         let path = entry.path();
         let relative = path.strip_prefix(source_root).unwrap_or(&path);
-        if relative.components().any(|component| {
-            matches!(
-                component.as_os_str().to_str(),
-                Some(".git" | "target" | "node_modules" | "_build" | ".zig-cache" | "zig-out")
-            )
-        }) {
+        if contains_generated_component(relative) {
             continue;
         }
         let target = destination.join(relative);
@@ -724,9 +730,7 @@ fn copy_rust_project(
 }
 
 fn seed_project_entries(root: &Path, entries: &[String]) -> FrontendResult<()> {
-    let mut files = Vec::new();
-    collect_rust_sources(root, &mut files)?;
-    files.sort();
+    let files = collect_source_files(root, &["rs"])?;
     for file in files {
         let source = fs::read_to_string(&file)?;
         if let Some(seeded) = append_entry_seeds(&source, entries)? {
@@ -737,26 +741,45 @@ fn seed_project_entries(root: &Path, entries: &[String]) -> FrontendResult<()> {
 }
 
 fn remap_analysis_root(analysis: &mut FileAnalysis, from: &Path, to: &Path) {
-    let remap = |path: &mut PathBuf| {
-        if let Ok(relative) = path.strip_prefix(from) {
-            *path = to.join(relative);
-        }
-    };
+    transform_analysis_paths(analysis, |path| {
+        path.strip_prefix(from)
+            .ok()
+            .map(|relative| to.join(relative))
+    });
+}
+
+fn relativize_analysis_root(analysis: &mut FileAnalysis, root: &Path) {
+    transform_analysis_paths(analysis, |path| {
+        path.strip_prefix(root).ok().map(Path::to_path_buf)
+    });
+}
+
+fn materialize_analysis_root(analysis: &mut FileAnalysis, root: &Path) {
+    transform_analysis_paths(analysis, |path| path.is_relative().then(|| root.join(path)));
+}
+
+fn transform_analysis_paths(
+    analysis: &mut FileAnalysis,
+    mut transform: impl FnMut(&Path) -> Option<PathBuf>,
+) {
     for function in &mut analysis.functions {
-        remap(&mut function.span.file);
+        if let Some(path) = transform(&function.span.file) {
+            function.span.file = path;
+        }
         for call in &mut function.calls {
-            remap(&mut call.span.file);
+            if let Some(path) = transform(&call.span.file) {
+                call.span.file = path;
+            }
         }
     }
     for fact in &mut analysis.facts {
-        remap(&mut fact.span.file);
+        if let Some(path) = transform(&fact.span.file) {
+            fact.span.file = path;
+        }
     }
     analysis.source_files = std::mem::take(&mut analysis.source_files)
         .into_iter()
-        .map(|mut file| {
-            remap(&mut file);
-            file
-        })
+        .map(|file| transform(&file).unwrap_or(file))
         .collect();
 }
 
@@ -774,47 +797,21 @@ fn remove_seed_functions(analysis: &mut FileAnalysis) {
 }
 
 fn analyze_project_sources(root: &Path) -> FrontendResult<FileAnalysis> {
-    let mut files = Vec::new();
-    collect_rust_sources(root, &mut files)?;
-    files.sort();
+    let files = collect_source_files(root, &["rs"])?;
     let mut combined = FileAnalysis::default();
     for file in files {
         let source = fs::read_to_string(&file)?;
         let module = rust_module_path(root, &file);
-        let mut analysis = RustBackend.analyze_file(
+        let analysis = RustBackend.analyze_file(
             &FileContext {
                 path: &file,
                 module: &module,
             },
             &source,
         )?;
-        combined.functions.append(&mut analysis.functions);
-        combined.facts.append(&mut analysis.facts);
-        combined.source_files.append(&mut analysis.source_files);
+        combined.append(analysis);
     }
     Ok(combined)
-}
-
-fn collect_rust_sources(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            if !matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some(".git" | "target" | "node_modules" | ".zig-cache" | "zig-out" | "_build")
-            ) {
-                collect_rust_sources(&path, files)?;
-            }
-        } else if file_type.is_file()
-            && path.extension().and_then(|extension| extension.to_str()) == Some("rs")
-        {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn rust_module_path(root: &Path, file: &Path) -> Vec<String> {
@@ -1027,7 +1024,6 @@ struct SemanticProgram {
 struct CachedRustAnalysis {
     schema: u32,
     fingerprint: String,
-    root: PathBuf,
     analysis: FileAnalysis,
 }
 
@@ -1212,7 +1208,7 @@ struct MirCallFlow {
     arguments: Vec<DynFlow>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct BodyDynAnalysis {
     calls: Vec<Option<MirCallFlow>>,
     return_flow: DynFlow,
@@ -1228,6 +1224,34 @@ struct DynSummary {
     return_aliases: Vec<ReturnAlias>,
     return_alias_open: bool,
     parameter_effects: Vec<DynFlow>,
+}
+
+impl DynSummary {
+    fn merge_analysis(&mut self, analysis: &BodyDynAnalysis) -> bool {
+        let mut changed = self.return_flow.merge(&analysis.return_flow);
+        for alias in &analysis.return_aliases {
+            if !self.return_aliases.contains(alias) {
+                self.return_aliases.push(alias.clone());
+                changed = true;
+            }
+        }
+        if analysis.return_alias_open && !self.return_alias_open {
+            self.return_alias_open = true;
+            changed = true;
+        }
+        if self.parameter_effects.len() < analysis.parameter_effects.len() {
+            self.parameter_effects
+                .resize_with(analysis.parameter_effects.len(), DynFlow::default);
+        }
+        for (destination, source) in self
+            .parameter_effects
+            .iter_mut()
+            .zip(&analysis.parameter_effects)
+        {
+            changed |= destination.merge(source);
+        }
+        changed
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1286,60 +1310,76 @@ fn collect_rustc_program(path: &Path) -> FrontendResult<SemanticProgram> {
 
 fn collect_instances() -> (SemanticProgram, bool) {
     let crate_name = rustc_public::local_crate().name.to_string();
-    let trait_method_implementations = trait_method_implementations();
+    let mut dispatch_resolver = DispatchResolver::default();
     let (instance_bodies, observed_vtables, generated_coroutines, expanding_instantiation) =
-        collect_instance_bodies(&trait_method_implementations);
+        collect_instance_bodies(&mut dispatch_resolver);
     let local_instances = instance_bodies
         .iter()
         .map(|item| item.instance)
         .collect::<HashSet<_>>();
     let mut summaries = HashMap::<Instance, DynSummary>::new();
+    let mut body_analyses = HashMap::<Instance, BodyDynAnalysis>::new();
 
     // Return-value summaries remain symbolic in terms of the callee's formal
     // parameters. This lets a trait object cross ordinary helper functions
     // without losing its concrete provenance. The lattice is finite, so the
     // monotone iteration also handles recursive helpers.
-    let max_iterations = instance_bodies
+    let max_rounds = instance_bodies
         .iter()
         .map(|item| item.body.locals().len())
         .sum::<usize>()
         .saturating_add(instance_bodies.len())
         .max(1);
-    let mut summaries_converged = false;
-    for _ in 0..max_iterations {
-        let mut changed = false;
-        for item in &instance_bodies {
-            let analysis = analyze_body_dyn_flows(&item.body, &summaries, &local_instances);
-            let summary = summaries.entry(item.instance).or_default();
-            changed |= summary.return_flow.merge(&analysis.return_flow);
-            for alias in analysis.return_aliases {
-                if !summary.return_aliases.contains(&alias) {
-                    summary.return_aliases.push(alias);
-                    changed = true;
-                }
-            }
-            if analysis.return_alias_open && !summary.return_alias_open {
-                summary.return_alias_open = true;
-                changed = true;
-            }
-            if summary.parameter_effects.len() < analysis.parameter_effects.len() {
-                summary
-                    .parameter_effects
-                    .resize_with(analysis.parameter_effects.len(), DynFlow::default);
-            }
-            for (destination, source) in summary
-                .parameter_effects
-                .iter_mut()
-                .zip(&analysis.parameter_effects)
+    let instance_indices = instance_bodies
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.instance, index))
+        .collect::<HashMap<_, _>>();
+    let mut dependents = vec![Vec::<usize>::new(); instance_bodies.len()];
+    for (caller, item) in instance_bodies.iter().enumerate() {
+        for block in &item.body.blocks {
+            let TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+                continue;
+            };
+            if let Some(callee) = resolve_called_instance(&item.body, func)
+                && let Some(callee) = instance_indices.get(&callee)
             {
-                changed |= destination.merge(source);
+                dependents[*callee].push(caller);
             }
-        }
-        if !changed {
-            summaries_converged = true;
-            break;
         }
     }
+    for callers in &mut dependents {
+        callers.sort_unstable();
+        callers.dedup();
+    }
+
+    let mut pending = (0..instance_bodies.len()).collect::<VecDeque<_>>();
+    let mut queued = vec![true; instance_bodies.len()];
+    let max_steps = max_rounds.saturating_mul(instance_bodies.len().max(1));
+    let mut steps = 0usize;
+    while !pending.is_empty() && steps < max_steps {
+        let index = pending
+            .pop_front()
+            .expect("a non-empty summary worklist has a front item");
+        queued[index] = false;
+        steps += 1;
+        let item = &instance_bodies[index];
+        let analysis = analyze_body_dyn_flows(&item.body, &summaries, &local_instances);
+        let changed = summaries
+            .entry(item.instance)
+            .or_default()
+            .merge_analysis(&analysis);
+        body_analyses.insert(item.instance, analysis);
+        if changed {
+            for dependent in &dependents[index] {
+                if !queued[*dependent] {
+                    pending.push_back(*dependent);
+                    queued[*dependent] = true;
+                }
+            }
+        }
+    }
+    let summaries_converged = pending.is_empty();
     if !summaries_converged {
         for item in &instance_bodies {
             if type_contains_dyn(item.body.ret_local().ty) {
@@ -1351,6 +1391,15 @@ fn collect_instances() -> (SemanticProgram, bool) {
                     .insert(UnresolvedReason::AnalysisLimit);
             }
         }
+        body_analyses = instance_bodies
+            .iter()
+            .map(|item| {
+                (
+                    item.instance,
+                    analyze_body_dyn_flows(&item.body, &summaries, &local_instances),
+                )
+            })
+            .collect();
     }
     let mut raw_functions = Vec::new();
     let folded_coroutines = generated_coroutines
@@ -1374,8 +1423,7 @@ fn collect_instances() -> (SemanticProgram, bool) {
             instance,
             &generated_coroutines,
             &bodies_by_instance,
-            &summaries,
-            &local_instances,
+            &body_analyses,
         );
         for logical_item in &logical_bodies {
             let logical_body = &logical_item.item.body;
@@ -1498,7 +1546,7 @@ fn collect_instances() -> (SemanticProgram, bool) {
     let mut functions = specialize_semantic_functions(
         &raw_functions,
         &observed_vtables,
-        &trait_method_implementations,
+        &mut dispatch_resolver,
         &crate_name,
     );
     functions.sort_by(|left, right| left.key.cmp(&right.key));
@@ -1512,7 +1560,7 @@ fn collect_instances() -> (SemanticProgram, bool) {
 }
 
 fn collect_instance_bodies(
-    trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
+    dispatch_resolver: &mut DispatchResolver,
 ) -> (
     Vec<InstanceBody>,
     Vec<TraitRef>,
@@ -1529,10 +1577,13 @@ fn collect_instance_bodies(
     let mut bodies = Vec::new();
     let mut observed_vtables = Vec::<TraitRef>::new();
     let mut observed_vtable_keys = HashSet::new();
+    let mut virtual_dispatches = Vec::<Instance>::new();
+    let mut observed_dispatches = HashSet::<Instance>::new();
+    let mut dispatch_pairs = VecDeque::<(Instance, usize)>::new();
     let mut generated_coroutines = HashMap::<Instance, Vec<Instance>>::new();
     let mut expanding_instantiation = false;
 
-    loop {
+    while !queue.is_empty() || !dispatch_pairs.is_empty() {
         while let Some((instance, history)) = queue.pop_front() {
             if !visited.insert(instance) {
                 continue;
@@ -1541,7 +1592,15 @@ fn collect_instance_bodies(
                 continue;
             };
 
+            let previous_vtable_count = observed_vtables.len();
             collect_observed_vtables(&body, &mut observed_vtables, &mut observed_vtable_keys);
+            for vtable_index in previous_vtable_count..observed_vtables.len() {
+                dispatch_pairs.extend(
+                    virtual_dispatches
+                        .iter()
+                        .map(|dispatch| (*dispatch, vtable_index)),
+                );
+            }
 
             for block in &body.blocks {
                 for statement in &block.statements {
@@ -1580,8 +1639,13 @@ fn collect_instance_bodies(
                 let Some(target) = resolve_called_instance(&body, func) else {
                     continue;
                 };
-                if !matches!(target.kind, InstanceKind::Virtual { .. })
-                    && target.has_body()
+                if matches!(target.kind, InstanceKind::Virtual { .. }) {
+                    if observed_dispatches.insert(target) {
+                        virtual_dispatches.push(target);
+                        dispatch_pairs
+                            .extend((0..observed_vtables.len()).map(|index| (target, index)));
+                    }
+                } else if target.has_body()
                     && (target.def.krate().is_local
                         || instance_body_is_in_analysis_root(target)
                         || call_boundary_contains_dyn(&body, args, destination))
@@ -1598,39 +1662,21 @@ fn collect_instance_bodies(
             bodies.push(InstanceBody { instance, body });
         }
 
-        for item in &bodies {
-            for block in &item.body.blocks {
-                let TerminatorKind::Call { func, .. } = &block.terminator.kind else {
-                    continue;
-                };
-                let Some(dispatch) = resolve_called_instance(&item.body, func) else {
-                    continue;
-                };
-                if !matches!(dispatch.kind, InstanceKind::Virtual { .. }) {
-                    continue;
-                }
-                for trait_ref in &observed_vtables {
-                    let Some(candidate) = resolve_observed_dispatch_candidate(
-                        dispatch,
-                        trait_ref,
-                        trait_method_implementations,
-                    ) else {
-                        continue;
-                    };
-                    if candidate.has_body() && !visited.contains(&candidate) {
-                        enqueue_rust_instance(
-                            &mut queue,
-                            candidate,
-                            &HashMap::new(),
-                            &visited,
-                            &mut expanding_instantiation,
-                        );
-                    }
-                }
+        while let Some((dispatch, vtable_index)) = dispatch_pairs.pop_front() {
+            let Some(candidate) =
+                dispatch_resolver.observed_candidate(dispatch, &observed_vtables[vtable_index])
+            else {
+                continue;
+            };
+            if candidate.has_body() && !visited.contains(&candidate) {
+                enqueue_rust_instance(
+                    &mut queue,
+                    candidate,
+                    &HashMap::new(),
+                    &visited,
+                    &mut expanding_instantiation,
+                );
             }
-        }
-        if queue.is_empty() {
-            break;
         }
     }
     (
@@ -1697,8 +1743,7 @@ fn source_logical_instance_bodies<'a>(
     root: Instance,
     generated_coroutines: &HashMap<Instance, Vec<Instance>>,
     bodies: &HashMap<Instance, &'a InstanceBody>,
-    summaries: &HashMap<Instance, DynSummary>,
-    analyzed_instances: &HashSet<Instance>,
+    analyses: &HashMap<Instance, BodyDynAnalysis>,
 ) -> Vec<SourceLogicalInstanceBody<'a>> {
     let Some(root_body) = bodies.get(&root) else {
         return Vec::new();
@@ -1726,7 +1771,7 @@ fn source_logical_instance_bodies<'a>(
         let Some(item) = bodies.get(&instance).copied() else {
             continue;
         };
-        let analysis = analyze_body_dyn_flows(&item.body, summaries, analyzed_instances);
+        let analysis = analyses.get(&instance).cloned().unwrap_or_default();
         if let Some(children) = generated_coroutines.get(&instance) {
             for child in children {
                 let Some(child_body) = bodies.get(child) else {
@@ -1865,19 +1910,6 @@ fn dyn_coercion(source: Ty, target: Ty) -> Option<(Ty, Binder<ExistentialTraitRe
     }
 }
 
-fn trait_method_implementations() -> HashMap<rustc_public::DefId, rustc_public::DefId> {
-    rustc_public::all_trait_impls()
-        .into_iter()
-        .flat_map(|implementation| implementation.associated_items())
-        .filter_map(|item| match item.container {
-            AssocContainer::TraitImpl(trait_item) => {
-                Some((item.def_id.def_id(), trait_item.def_id()))
-            }
-            AssocContainer::InherentImpl | AssocContainer::Trait => None,
-        })
-        .collect()
-}
-
 fn resolve_called_instance(body: &Body, operand: &Operand) -> Option<Instance> {
     let function_type = operand.ty(body.locals()).ok()?;
     let function_kind = function_type.kind();
@@ -1885,11 +1917,7 @@ fn resolve_called_instance(body: &Body, operand: &Operand) -> Option<Instance> {
     Instance::resolve(definition, arguments).ok()
 }
 
-fn resolve_dispatch_candidate(
-    dispatch: Instance,
-    trait_ref: &TraitRef,
-    _trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
-) -> Option<Instance> {
+fn resolve_dispatch_candidate(dispatch: Instance, trait_ref: &TraitRef) -> Option<Instance> {
     let InstanceKind::Virtual { idx } = dispatch.kind else {
         return None;
     };
@@ -1929,10 +1957,10 @@ fn dispatch_principal_matches_observed_vtable(dispatch: Instance, observed: &Tra
 fn resolve_observed_dispatch_candidate(
     dispatch: Instance,
     observed: &TraitRef,
-    trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
+    trait_method_implementations: &mut HashMap<rustc_public::DefId, Option<rustc_public::DefId>>,
 ) -> Option<Instance> {
     if dispatch_principal_matches_observed_vtable(dispatch, observed) {
-        return resolve_dispatch_candidate(dispatch, observed, trait_method_implementations);
+        return resolve_dispatch_candidate(dispatch, observed);
     }
     let trait_method = dispatch.def.def_id();
     observed.vtable_entries().into_iter().find_map(|entry| {
@@ -1941,9 +1969,70 @@ fn resolve_observed_dispatch_candidate(
         };
         let candidate_method = candidate.def.def_id();
         (candidate_method == trait_method
-            || trait_method_implementations.get(&candidate_method) == Some(&trait_method))
+            || trait_method_for_impl_method(candidate_method, trait_method_implementations)
+                == Some(trait_method))
         .then_some(candidate)
     })
+}
+
+fn trait_method_for_impl_method(
+    implementation_method: rustc_public::DefId,
+    cache: &mut HashMap<rustc_public::DefId, Option<rustc_public::DefId>>,
+) -> Option<rustc_public::DefId> {
+    if let Some(trait_method) = cache.get(&implementation_method) {
+        return *trait_method;
+    }
+    let Some(parent) = implementation_method.parent() else {
+        cache.insert(implementation_method, None);
+        return None;
+    };
+    for item in ImplDef(parent).associated_items() {
+        let trait_method = match item.container {
+            AssocContainer::TraitImpl(trait_item) => Some(trait_item.def_id()),
+            AssocContainer::InherentImpl | AssocContainer::Trait => None,
+        };
+        cache.insert(item.def_id.def_id(), trait_method);
+    }
+    *cache.entry(implementation_method).or_insert(None)
+}
+
+type DispatchCandidateCache = HashMap<
+    (
+        Instance,
+        rustc_public::ty::TraitDef,
+        rustc_public::ty::GenericArgs,
+    ),
+    Option<Instance>,
+>;
+
+#[derive(Default)]
+struct DispatchResolver {
+    observed: DispatchCandidateCache,
+    concrete: DispatchCandidateCache,
+    trait_methods: HashMap<rustc_public::DefId, Option<rustc_public::DefId>>,
+}
+
+impl DispatchResolver {
+    fn observed_candidate(&mut self, dispatch: Instance, observed: &TraitRef) -> Option<Instance> {
+        let key = (dispatch, observed.def_id, observed.args().clone());
+        if let Some(candidate) = self.observed.get(&key) {
+            return *candidate;
+        }
+        let candidate =
+            resolve_observed_dispatch_candidate(dispatch, observed, &mut self.trait_methods);
+        self.observed.insert(key, candidate);
+        candidate
+    }
+
+    fn concrete_candidate(&mut self, dispatch: Instance, observed: &TraitRef) -> Option<Instance> {
+        let key = (dispatch, observed.def_id, observed.args().clone());
+        if let Some(candidate) = self.concrete.get(&key) {
+            return *candidate;
+        }
+        let candidate = resolve_dispatch_candidate(dispatch, observed);
+        self.concrete.insert(key, candidate);
+        candidate
+    }
 }
 
 fn dynamic_principal(ty: Ty) -> Option<Binder<ExistentialTraitRef>> {
@@ -3085,7 +3174,7 @@ fn resolve_symbolic_flow(flow: &DynFlow, arguments: &[DynFlow]) -> DynFlow {
 fn specialize_semantic_functions(
     raw_functions: &[RawSemanticFunction],
     observed_vtables: &[TraitRef],
-    trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
+    dispatch_resolver: &mut DispatchResolver,
     crate_name: &str,
 ) -> Vec<SemanticFunction> {
     let index = raw_functions
@@ -3104,11 +3193,9 @@ fn specialize_semantic_functions(
                 }
                 RawSemanticCallTarget::Dynamic { dispatch, .. } => {
                     for trait_ref in observed_vtables {
-                        let Some(candidate) = resolve_observed_dispatch_candidate(
-                            *dispatch,
-                            trait_ref,
-                            trait_method_implementations,
-                        ) else {
+                        let Some(candidate) =
+                            dispatch_resolver.observed_candidate(*dispatch, trait_ref)
+                        else {
                             continue;
                         };
                         let candidate_name = stable_instance_name(candidate);
@@ -3175,11 +3262,9 @@ fn specialize_semantic_functions(
                         let receiver = resolve_context_flow(receiver, &context);
                         let mut candidates = Vec::new();
                         for trait_ref in &receiver.concrete {
-                            let Some(candidate) = resolve_dispatch_candidate(
-                                *dispatch,
-                                trait_ref,
-                                trait_method_implementations,
-                            ) else {
+                            let Some(candidate) =
+                                dispatch_resolver.concrete_candidate(*dispatch, trait_ref)
+                            else {
                                 continue;
                             };
                             let candidate_name = stable_instance_name(candidate);
@@ -3818,7 +3903,7 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
                     let is_constructor = semantic_function
                         .constructor_spans
                         .iter()
-                        .any(|span| span_coordinates_equal(&call.span, span))
+                        .any(|span| call.span.has_same_coordinates(span))
                         || call_syntax_name(call).is_some_and(|name| {
                             semantic_function
                                 .constructor_names
@@ -3908,13 +3993,10 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
                                     ),
                                 })
                                 .collect(),
-                            resolution: if candidates.is_empty() {
-                                DispatchResolution::Unresolved
-                            } else if *open {
-                                DispatchResolution::Partial
-                            } else {
-                                DispatchResolution::Complete
-                            },
+                            resolution: DispatchResolution::from_candidates(
+                                !candidates.is_empty(),
+                                *open,
+                            ),
                             evidence: DispatchEvidence::ExactFlow,
                             unresolved_reasons: if unresolved_reasons.is_empty()
                                 && candidates.is_empty()
@@ -4214,9 +4296,9 @@ fn semantic_closure_keys(
                 .filter(|function| {
                     source_file_identity(file_identities, &closure.span.file)
                         == source_file_identity(file_identities, &function.body_span.file)
-                        && span_contains(&closure.span, &function.body_span)
+                        && closure.span.contains(&function.body_span)
                 })
-                .min_by_key(|function| span_size(&function.body_span))
+                .min_by_key(|function| function.body_span.extent())
                 .map(|function| (closure.id.clone(), function.key.clone()))
         })
         .collect()
@@ -4526,9 +4608,9 @@ fn closure_for_body_span<'a>(
         .filter(|closure| {
             source_file_identity(file_identities, &closure.span.file)
                 == source_file_identity(file_identities, &body.file)
-                && span_contains(&closure.span, body)
+                && closure.span.contains(body)
         })
-        .min_by_key(|closure| span_size(&closure.span))
+        .min_by_key(|closure| closure.span.extent())
 }
 
 fn rewrite_located_closures(
@@ -4684,8 +4766,8 @@ fn best_function_template<'a>(
     candidate_indices
         .iter()
         .filter_map(|index| functions.get(*index))
-        .filter(|function| span_contains(&function.span, body_span))
-        .min_by_key(|function| span_size(&function.span))
+        .filter(|function| function.span.contains(body_span))
+        .min_by_key(|function| function.span.extent())
 }
 
 fn best_semantic_call(
@@ -4703,7 +4785,7 @@ fn best_semantic_call(
             if claimed.contains(index)
                 || source_file_identity(file_identities, &syntax_call.span.file)
                     != source_file_identity(file_identities, &call.span.file)
-                || !spans_overlap(&syntax_call.span, &call.span)
+                || !syntax_call.span.overlaps(&call.span)
             {
                 return false;
             }
@@ -4713,7 +4795,7 @@ fn best_semantic_call(
                 .next()
                 .unwrap_or(&call.definition_name);
             syntax_name.is_none_or(|syntax_name| definition_leaf == syntax_name)
-                || span_coordinates_equal(&syntax_call.span, &call.span)
+                || syntax_call.span.has_same_coordinates(&call.span)
         })
         .min_by_key(|(_, call)| {
             let definition_leaf = call
@@ -4724,7 +4806,7 @@ fn best_semantic_call(
             let name_penalty = syntax_name
                 .map(|syntax_name| usize::from(definition_leaf != syntax_name) * 1_000_000)
                 .unwrap_or_default();
-            name_penalty + span_distance(&syntax_call.span, &call.span)
+            name_penalty + syntax_call.span.start_distance(&call.span)
         })
         .map(|(index, _)| index)
 }
@@ -4735,13 +4817,6 @@ fn call_syntax_name(call: &CallSite) -> Option<&str> {
         CallSyntax::SelfMethod(method) | CallSyntax::Method { method, .. } => Some(method.as_str()),
         CallSyntax::Expression(_) | CallSyntax::CompilerConfirmed(_) => None,
     }
-}
-
-fn span_coordinates_equal(left: &SourceSpan, right: &SourceSpan) -> bool {
-    left.start_line == right.start_line
-        && left.start_column == right.start_column
-        && left.end_line == right.end_line
-        && left.end_column == right.end_column
 }
 
 fn semantic_symbol(name: String) -> SymbolId {
@@ -5308,59 +5383,7 @@ fn rustc_source_span(span: rustc_public::ty::Span) -> SourceSpan {
 }
 
 fn source_files_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
-            .canonicalize()
-            .ok()
-            .zip(right.canonicalize().ok())
-            .is_some_and(|(left, right)| left == right)
-}
-
-fn span_contains(outer: &SourceSpan, inner: &SourceSpan) -> bool {
-    position_le(
-        outer.start_line,
-        outer.start_column,
-        inner.start_line,
-        inner.start_column,
-    ) && position_le(
-        inner.end_line,
-        inner.end_column,
-        outer.end_line,
-        outer.end_column,
-    )
-}
-
-fn spans_overlap(left: &SourceSpan, right: &SourceSpan) -> bool {
-    position_le(
-        left.start_line,
-        left.start_column,
-        right.end_line,
-        right.end_column,
-    ) && position_le(
-        right.start_line,
-        right.start_column,
-        left.end_line,
-        left.end_column,
-    )
-}
-
-fn position_le(
-    left_line: usize,
-    left_column: usize,
-    right_line: usize,
-    right_column: usize,
-) -> bool {
-    (left_line, left_column) <= (right_line, right_column)
-}
-
-fn span_size(span: &SourceSpan) -> usize {
-    (span.end_line.saturating_sub(span.start_line) * 10_000)
-        + span.end_column.saturating_sub(span.start_column)
-}
-
-fn span_distance(left: &SourceSpan, right: &SourceSpan) -> usize {
-    left.start_line.abs_diff(right.start_line) * 10_000
-        + left.start_column.abs_diff(right.start_column)
+    paths_match(left, right)
 }
 
 impl LanguageBackend for RustBackend {
@@ -6877,8 +6900,12 @@ mod tests {
             parameter_types: Vec::new(),
         };
 
-        let specialized =
-            specialize_semantic_functions(&[function(), function()], &[], &HashMap::new(), "crate");
+        let specialized = specialize_semantic_functions(
+            &[function(), function()],
+            &[],
+            &mut DispatchResolver::default(),
+            "crate",
+        );
 
         assert_eq!(specialized.len(), 1);
         assert_eq!(specialized[0].key, "crate::duplicate");

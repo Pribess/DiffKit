@@ -87,6 +87,42 @@ pub struct SourceSpan {
     pub end_byte: Option<usize>,
 }
 
+impl SourceSpan {
+    pub fn has_same_coordinates(&self, other: &Self) -> bool {
+        self.start_line == other.start_line
+            && self.start_column == other.start_column
+            && self.end_line == other.end_line
+            && self.end_column == other.end_column
+    }
+
+    pub fn contains(&self, other: &Self) -> bool {
+        (self.start_line, self.start_column) <= (other.start_line, other.start_column)
+            && (other.end_line, other.end_column) <= (self.end_line, self.end_column)
+    }
+
+    pub fn overlaps(&self, other: &Self) -> bool {
+        (self.start_line, self.start_column) <= (other.end_line, other.end_column)
+            && (other.start_line, other.start_column) <= (self.end_line, self.end_column)
+    }
+
+    /// Stable source-order size used for choosing the tightest enclosing span.
+    pub fn extent(&self) -> usize {
+        self.end_line.saturating_sub(self.start_line) * 10_000
+            + self.end_column.saturating_sub(self.start_column)
+    }
+
+    pub fn start_distance(&self, other: &Self) -> usize {
+        self.start_line.abs_diff(other.start_line) * 10_000
+            + self.start_column.abs_diff(other.start_column)
+    }
+
+    pub fn boundary_distance(&self, other: &Self) -> usize {
+        self.start_distance(other)
+            + self.end_line.abs_diff(other.end_line) * 10_000
+            + self.end_column.abs_diff(other.end_column)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CallSyntax {
     Path(Vec<String>),
@@ -169,6 +205,27 @@ pub enum CallTarget {
     },
 }
 
+impl CallTarget {
+    pub fn dynamic(
+        dispatch: SymbolId,
+        candidates: Vec<DispatchCandidate>,
+        evidence: DispatchEvidence,
+        unresolved_reasons: BTreeSet<UnresolvedReason>,
+    ) -> Self {
+        let resolution = DispatchResolution::from_candidates(
+            !candidates.is_empty(),
+            !unresolved_reasons.is_empty(),
+        );
+        Self::Dynamic {
+            dispatch,
+            candidates,
+            resolution,
+            evidence,
+            unresolved_reasons,
+        }
+    }
+}
+
 /// Why a candidate set is justified when it is complete.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DispatchEvidence {
@@ -226,6 +283,16 @@ pub enum DispatchResolution {
     Complete,
     Partial,
     Unresolved,
+}
+
+impl DispatchResolution {
+    pub fn from_candidates(has_candidates: bool, has_unresolved_sources: bool) -> Self {
+        match (has_candidates, has_unresolved_sources) {
+            (false, _) => Self::Unresolved,
+            (true, true) => Self::Partial,
+            (true, false) => Self::Complete,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +368,18 @@ pub struct SemanticCallGraph {
     /// Compiler-provided roots when the backend has authoritative entry
     /// information. The common graph infers component roots only when empty.
     pub roots: BTreeSet<SymbolId>,
+}
+
+impl SemanticCallGraph {
+    /// Merge a frontend fragment without exposing storage details to each
+    /// language implementation. This is the common composition point for
+    /// multi-file projects.
+    pub fn append(&mut self, mut fragment: Self) {
+        self.functions.append(&mut fragment.functions);
+        self.facts.append(&mut fragment.facts);
+        self.source_files.append(&mut fragment.source_files);
+        self.roots.append(&mut fragment.roots);
+    }
 }
 
 /// Compatibility name for the per-file graph fragment returned by source

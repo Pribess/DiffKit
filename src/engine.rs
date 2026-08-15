@@ -6,7 +6,8 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::DiffkitResult;
 use crate::diff::{
-    DiffNode, collapse_unchanged_subtrees, diff_optional, tree_has_changes, truncate_diff_tree,
+    DiffNode, collapse_unchanged_subtrees, diff_optional, nodes_equivalent, tree_has_changes,
+    truncate_diff_tree,
 };
 use crate::graph::ProgramGraph;
 use crate::language::ocaml::OcamlFrontend;
@@ -16,12 +17,14 @@ use crate::language::rust::{
 };
 use crate::language::{FileContext, LanguageBackend, ProjectContext};
 use crate::model::{CallNode, FileAnalysis, SymbolId};
+use crate::source::{collect_source_files, paths_match};
 
 static CARGO_SOURCE_LAYOUTS: OnceLock<Mutex<HashMap<PathBuf, Option<CargoSourceLayout>>>> =
     OnceLock::new();
 
 #[derive(Clone)]
 struct CargoSourceLayout {
+    workspace_root: PathBuf,
     package_roots: Vec<PathBuf>,
     target_sources: Vec<PathBuf>,
 }
@@ -56,6 +59,14 @@ pub struct DiffReport {
     pub message: Option<String>,
     pub analyzed_files: BTreeSet<PathBuf>,
     pub diagnostics: Vec<String>,
+}
+
+impl DiffReport {
+    pub fn analyzes_path(&self, path: &Path) -> bool {
+        self.analyzed_files
+            .iter()
+            .any(|analyzed| paths_match(analyzed, path))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -139,10 +150,11 @@ pub fn rustdiff_project_paths_cached(
     options: &DiffOptions,
     verbose: bool,
 ) -> DiffkitResult<DiffReport> {
-    let before_session =
+    let mut before_session =
         RustProjectSession::create_cached(cache_project_root, "git-before", verbose)?;
-    let after_session =
+    let mut after_session =
         RustProjectSession::create_cached(cache_project_root, "git-after", verbose)?;
+    limit_parallel_cargo_jobs(&mut before_session, &mut after_session);
     rustdiff_project_paths_with_sessions(
         before_root,
         after_root,
@@ -222,8 +234,10 @@ pub fn rustdiff_project_files(
 ) -> DiffkitResult<Option<DiffReport>> {
     let before_root = find_cargo_root(before_file)?;
     let after_root = find_cargo_root(after_file)?;
-    let before_session = RustProjectSession::create_cached(&before_root, "file-before", verbose)?;
-    let after_session = RustProjectSession::create_cached(&after_root, "file-after", verbose)?;
+    let mut before_session =
+        RustProjectSession::create_cached(&before_root, "file-before", verbose)?;
+    let mut after_session = RustProjectSession::create_cached(&after_root, "file-after", verbose)?;
+    limit_parallel_cargo_jobs(&mut before_session, &mut after_session);
     let (before, after) = rust_project_graphs_parallel(
         &before_root,
         &after_root,
@@ -653,8 +667,7 @@ fn changed_entries_in_files(
         .filter_map(|entry| {
             let before_root = before.build_call_tree_in_file(&entry, 0, before_file);
             let after_root = after.build_call_tree_in_file(&entry, 0, after_file);
-            let root_changed = diff_optional(before_root.as_ref(), after_root.as_ref())
-                .is_some_and(|tree| tree_has_changes(&tree));
+            let root_changed = call_trees_differ(before_root.as_ref(), after_root.as_ref());
             if !root_changed
                 && !before_relevant.contains(&entry)
                 && !after_relevant.contains(&entry)
@@ -704,10 +717,17 @@ fn locally_changed_symbols(
         .filter(|symbol| {
             let before_shape = before.local_call_shape(symbol, before_file);
             let after_shape = after.local_call_shape(symbol, after_file);
-            diff_optional(before_shape.as_ref(), after_shape.as_ref())
-                .is_some_and(|tree| tree_has_changes(&tree))
+            call_trees_differ(before_shape.as_ref(), after_shape.as_ref())
         })
         .collect()
+}
+
+fn call_trees_differ(before: Option<&CallNode>, after: Option<&CallNode>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => !nodes_equivalent(before, after),
+        (None, None) => false,
+        (Some(_), None) | (None, Some(_)) => true,
+    }
 }
 
 fn load_path(path: &Path, frontend: &impl LanguageBackend) -> DiffkitResult<ProgramGraph> {
@@ -800,6 +820,15 @@ fn rust_project_graphs_parallel(
     })
 }
 
+fn limit_parallel_cargo_jobs(before: &mut RustProjectSession, after: &mut RustProjectSession) {
+    let Some(parallelism) = std::thread::available_parallelism().ok() else {
+        return;
+    };
+    let jobs = (parallelism.get() / 2).max(1);
+    before.limit_cargo_jobs(jobs);
+    after.limit_cargo_jobs(jobs);
+}
+
 fn ocaml_project_graph(
     root: &Path,
     frontend: &impl LanguageBackend,
@@ -861,6 +890,13 @@ pub fn rust_file_is_project_source(path: &Path) -> bool {
             .any(|source| target_contains_source(source, &absolute))
 }
 
+/// Resolve Cargo's workspace root while sharing the metadata query used for
+/// source-target membership checks.
+pub fn cargo_workspace_root(path: &Path) -> Option<PathBuf> {
+    let root = find_cargo_root(path).ok()?;
+    cargo_source_layout(&root).map(|layout| layout.workspace_root)
+}
+
 fn cargo_source_layout(root: &Path) -> Option<CargoSourceLayout> {
     let cache = CARGO_SOURCE_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(layout) = cache.lock().ok()?.get(root).cloned() {
@@ -876,6 +912,10 @@ fn cargo_source_layout(root: &Path) -> Option<CargoSourceLayout> {
         .filter(|output| output.status.success())
         .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
         .and_then(|metadata| {
+            let workspace_root = metadata
+                .get("workspace_root")?
+                .as_str()
+                .map(PathBuf::from)?;
             let packages = metadata.get("packages")?.as_array()?;
             let package_roots = packages
                 .iter()
@@ -898,6 +938,7 @@ fn cargo_source_layout(root: &Path) -> Option<CargoSourceLayout> {
                 .map(PathBuf::from)
                 .collect();
             Some(CargoSourceLayout {
+                workspace_root,
                 package_roots,
                 target_sources,
             })
@@ -928,43 +969,6 @@ fn target_contains_source(target: &Path, file: &Path) -> bool {
     }
 }
 
-fn collect_source_files(path: &Path, extensions: &[&str]) -> DiffkitResult<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    if path.is_file() {
-        if has_extension(path, extensions) {
-            files.push(path.to_path_buf());
-        }
-    } else {
-        collect_directory(path, extensions, &mut files)?;
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn collect_directory(
-    directory: &Path,
-    extensions: &[&str],
-    files: &mut Vec<PathBuf>,
-) -> DiffkitResult<()> {
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-    for entry in entries {
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-        if file_type.is_dir() {
-            if !matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some("target" | ".git" | "_build" | "node_modules" | ".zig-cache" | "zig-out")
-            ) {
-                collect_directory(&path, extensions, files)?;
-            }
-        } else if file_type.is_file() && has_extension(&path, extensions) {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn find_ocaml_root(path: &Path) -> PathBuf {
     let start = if path.is_dir() {
         path
@@ -977,12 +981,6 @@ fn find_ocaml_root(path: &Path) -> PathBuf {
         }
     }
     start.to_path_buf()
-}
-
-fn has_extension(path: &Path, extensions: &[&str]) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extensions.contains(&extension))
 }
 
 fn module_path(root: &Path, file: &Path) -> Vec<String> {
@@ -1026,6 +1024,10 @@ mod tests {
     fn cargo_test_targets_are_project_sources() {
         let test = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli.rs");
         assert!(rust_file_is_project_source(&test));
+        assert_eq!(
+            cargo_workspace_root(&test),
+            Path::new(env!("CARGO_MANIFEST_DIR")).canonicalize().ok()
+        );
     }
 
     #[test]

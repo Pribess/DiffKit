@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
@@ -6,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 use super::{FileContext, FrontendResult, LanguageBackend, ProjectContext};
 use crate::model::{
@@ -14,9 +15,27 @@ use crate::model::{
     DispatchResolution, FileAnalysis, FunctionInfo, LanguageFact, LanguageId, SourceSpan, SymbolId,
     UnresolvedReason,
 };
+use crate::source::{collect_files_with_extension, collect_source_files, paths_match};
 
 static OCAML_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const OCAML_EXTRACTOR_SOURCE: &str = include_str!("../../support/ocaml/extract.ml");
+
+thread_local! {
+    /// Expression flow performs many small parses during specialization. A
+    /// parser is reusable after each returned `Tree`, so keep one per worker
+    /// thread instead of rebuilding its language tables for every argument.
+    static OCAML_EXPRESSION_PARSER: RefCell<Option<Parser>> = RefCell::new({
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ocaml::LANGUAGE_OCAML.into())
+            .ok()
+            .map(|_| parser)
+    });
+}
+
+fn parse_ocaml_expression(source: &str) -> Option<Tree> {
+    OCAML_EXPRESSION_PARSER.with(|parser| parser.borrow_mut().as_mut()?.parse(source, None))
+}
 
 /// OCaml's source-label stage. Dune projects overlay compiler-libs Typedtree
 /// paths in `analyze_semantic_project`; standalone source sets retain
@@ -52,9 +71,7 @@ pub fn analyze_semantic_project(root: &Path) -> FrontendResult<FileAnalysis> {
     }
 
     let helper = OcamlExtractor::compile()?;
-    let mut cmt_files = Vec::new();
-    collect_files_with_extension(&root.join("_build"), "cmt", &mut cmt_files)?;
-    cmt_files.sort();
+    let cmt_files = collect_files_with_extension(&root.join("_build"), "cmt")?;
     let mut events = Vec::new();
     for cmt in cmt_files {
         let output = Command::new(helper.executable()).arg(&cmt).output()?;
@@ -73,9 +90,7 @@ pub fn analyze_semantic_project(root: &Path) -> FrontendResult<FileAnalysis> {
         )?);
     }
 
-    let mut source_files = Vec::new();
-    collect_ocaml_sources(&root, &mut source_files)?;
-    source_files.sort();
+    let source_files = collect_source_files(&root, &["ml", "mli"])?;
     let mut analysis = FileAnalysis::default();
     for file in source_files {
         let source = fs::read_to_string(&file)?;
@@ -88,11 +103,7 @@ pub fn analyze_semantic_project(root: &Path) -> FrontendResult<FileAnalysis> {
             &source,
         )?;
         apply_typed_events(&mut file_analysis, &events);
-        analysis.functions.append(&mut file_analysis.functions);
-        analysis.facts.append(&mut file_analysis.facts);
-        analysis
-            .source_files
-            .append(&mut file_analysis.source_files);
+        analysis.append(file_analysis);
     }
     resolve_ocaml_function_values(&mut analysis);
     Ok(analysis)
@@ -102,9 +113,7 @@ pub fn analyze_semantic_project(root: &Path) -> FrontendResult<FileAnalysis> {
 /// standalone source trees; Dune projects use `analyze_semantic_project`.
 pub fn analyze_source_project(root: &Path) -> FrontendResult<FileAnalysis> {
     let root = root.canonicalize()?;
-    let mut files = Vec::new();
-    collect_ocaml_sources(&root, &mut files)?;
-    files.sort();
+    let files = collect_source_files(&root, &["ml", "mli"])?;
     let mut analysis = FileAnalysis::default();
     for file in files {
         let source = fs::read_to_string(&file)?;
@@ -119,11 +128,7 @@ pub fn analyze_source_project(root: &Path) -> FrontendResult<FileAnalysis> {
         if let Some(events) = standalone_typed_events(&file, &source)? {
             apply_typed_events(&mut file_analysis, &events);
         }
-        analysis.functions.append(&mut file_analysis.functions);
-        analysis.facts.append(&mut file_analysis.facts);
-        analysis
-            .source_files
-            .append(&mut file_analysis.source_files);
+        analysis.append(file_analysis);
     }
     resolve_ocaml_function_values(&mut analysis);
     Ok(analysis)
@@ -364,9 +369,7 @@ fn disambiguate_ocaml_shadowed_bindings(analysis: &mut FileAnalysis) {
             let new_owner_text = new_owner.to_string();
 
             for function in &mut analysis.functions {
-                if function.span.file != owner.span.file
-                    || !ocaml_span_contains(&owner.span, &function.span)
-                {
+                if function.span.file != owner.span.file || !owner.span.contains(&function.span) {
                     continue;
                 }
                 let old = function.id.clone();
@@ -393,7 +396,7 @@ fn disambiguate_ocaml_shadowed_bindings(analysis: &mut FileAnalysis) {
         if let Some(remap) = remaps.iter().find(|remap| {
             fact.subject == remap.old
                 && fact.span.file == remap.owner_span.file
-                && ocaml_span_contains(&remap.owner_span, &fact.span)
+                && remap.owner_span.contains(&fact.span)
         }) {
             fact.subject = remap.new.clone();
         }
@@ -438,8 +441,7 @@ fn resolve_ocaml_recursive_groups(analysis: &mut FileAnalysis) {
             .collect::<Vec<_>>();
         for function in &mut analysis.functions {
             if !owners.iter().any(|owner| {
-                owner.span.file == function.span.file
-                    && ocaml_span_contains(&owner.span, &function.span)
+                owner.span.file == function.span.file && owner.span.contains(&function.span)
             }) {
                 continue;
             }
@@ -466,55 +468,6 @@ fn resolve_ocaml_recursive_groups(analysis: &mut FileAnalysis) {
             }
         }
     }
-}
-
-fn collect_files_with_extension(
-    directory: &Path,
-    extension: &str,
-    files: &mut Vec<PathBuf>,
-) -> std::io::Result<()> {
-    if !directory.is_dir() {
-        return Ok(());
-    }
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_files_with_extension(&path, extension, files)?;
-        } else if file_type.is_file()
-            && path.extension().and_then(|value| value.to_str()) == Some(extension)
-        {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn collect_ocaml_sources(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            if !matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some("_build" | ".git" | "target" | "node_modules")
-            ) {
-                collect_ocaml_sources(&path, files)?;
-            }
-        } else if file_type.is_file()
-            && matches!(
-                path.extension().and_then(|value| value.to_str()),
-                Some("ml" | "mli")
-            )
-        {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn ocaml_file_module_path(root: &Path, file: &Path) -> Vec<String> {
@@ -610,9 +563,9 @@ fn apply_typed_events(analysis: &mut FileAnalysis, events: &[TypedCallEvent]) {
                 .filter(|(index, _)| !claimed.contains(index))
                 .filter(|event| {
                     ocaml_source_files_match(&event.1.span.file, &call.span.file)
-                        && ocaml_spans_overlap(&event.1.span, &call.span)
+                        && event.1.span.overlaps(&call.span)
                 })
-                .min_by_key(|(_, event)| ocaml_span_distance(&event.span, &call.span))
+                .min_by_key(|(_, event)| event.span.boundary_distance(&call.span))
             else {
                 continue;
             };
@@ -720,24 +673,7 @@ fn ocaml_path_symbol(path: &str) -> SymbolId {
 }
 
 fn ocaml_source_files_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
-            .canonicalize()
-            .ok()
-            .zip(right.canonicalize().ok())
-            .is_some_and(|(left, right)| left == right)
-}
-
-fn ocaml_spans_overlap(left: &SourceSpan, right: &SourceSpan) -> bool {
-    (left.start_line, left.start_column) <= (right.end_line, right.end_column)
-        && (right.start_line, right.start_column) <= (left.end_line, left.end_column)
-}
-
-fn ocaml_span_distance(left: &SourceSpan, right: &SourceSpan) -> usize {
-    left.start_line.abs_diff(right.start_line) * 10_000
-        + left.start_column.abs_diff(right.start_column)
-        + left.end_line.abs_diff(right.end_line) * 10_000
-        + left.end_column.abs_diff(right.end_column)
+    paths_match(left, right)
 }
 
 fn ocaml_module_name(value: &str) -> String {
@@ -1143,6 +1079,7 @@ fn local_callable_label(label: &CallLabel, name: &str, ordinal: usize) -> CallLa
 
 fn resolve_local_callables(analysis: &mut FileAnalysis) {
     let functions = analysis.functions.clone();
+    let symbols = OcamlSymbols::new(&functions);
     let scopes = ocaml_local_callable_scopes(&analysis.facts);
     for function in &mut analysis.functions {
         for call in &mut function.calls {
@@ -1153,10 +1090,10 @@ fn resolve_local_callables(analysis: &mut FileAnalysis) {
                 && let Some(candidate) = anonymous_callable_symbol_at(
                     expression,
                     &function.id,
-                    &functions,
+                    &symbols,
                     Some(&call.span),
                 )
-                && let Some(target) = functions.iter().find(|item| item.id == candidate)
+                && let Some(target) = symbols.get(&candidate)
             {
                 let arguments = ocaml_call_arguments(call);
                 call.target = CallTarget::Direct(candidate);
@@ -1174,8 +1111,8 @@ fn resolve_local_callables(analysis: &mut FileAnalysis) {
                 continue;
             };
             let candidate =
-                local_callable_at(name, &function.id, &functions, &scopes, Some(&call.span))
-                    .and_then(|id| functions.iter().find(|candidate| candidate.id == id));
+                local_callable_at(name, &function.id, &symbols, &scopes, Some(&call.span))
+                    .and_then(|id| symbols.get(&id));
             let Some(candidate) = candidate else {
                 continue;
             };
@@ -1195,18 +1132,17 @@ fn resolve_local_callables(analysis: &mut FileAnalysis) {
 fn local_callable_at(
     name: &str,
     caller: &SymbolId,
-    functions: &[FunctionInfo],
+    symbols: &OcamlSymbols<'_>,
     scopes: &BTreeMap<SymbolId, SourceSpan>,
     position: Option<&SourceSpan>,
 ) -> Option<SymbolId> {
     let direct_owner = caller.to_string();
     let sibling_owner = caller.container.as_deref();
-    let mut candidates = functions
-        .iter()
+    let mut candidates = symbols
+        .named(name)
         .filter(|candidate| {
             candidate.id.module == caller.module
                 && candidate.id.container.is_some()
-                && local_callable_source_name(candidate) == name
                 && (candidate.id.container.as_deref() == Some(direct_owner.as_str())
                     || candidate.id.container.as_deref() == sibling_owner
                     || candidate.id == *caller)
@@ -1214,7 +1150,7 @@ fn local_callable_at(
                     || position.is_none_or(|position| {
                         scopes
                             .get(&candidate.id)
-                            .is_some_and(|scope| ocaml_span_contains(scope, position))
+                            .is_some_and(|scope| scope.contains(position))
                     }))
         })
         .collect::<Vec<_>>();
@@ -1291,8 +1227,171 @@ struct OcamlCallFlow {
     span: SourceSpan,
 }
 
-struct OcamlFlowIndex<'a> {
+struct OcamlSymbols<'a> {
     functions: &'a [FunctionInfo],
+    by_id: BTreeMap<SymbolId, usize>,
+    by_name: BTreeMap<String, Vec<usize>>,
+    by_file: BTreeMap<PathBuf, Vec<usize>>,
+}
+
+impl<'a> OcamlSymbols<'a> {
+    fn new(functions: &'a [FunctionInfo]) -> Self {
+        let mut by_id = BTreeMap::new();
+        let mut by_name = BTreeMap::<String, Vec<usize>>::new();
+        let mut by_file = BTreeMap::<PathBuf, Vec<usize>>::new();
+        for (index, function) in functions.iter().enumerate() {
+            by_id.insert(function.id.clone(), index);
+            by_name
+                .entry(local_callable_source_name(function).to_owned())
+                .or_default()
+                .push(index);
+            by_file
+                .entry(function.span.file.clone())
+                .or_default()
+                .push(index);
+        }
+        let canonical_files = by_file
+            .iter()
+            .filter_map(|(file, functions)| {
+                let canonical = file.canonicalize().ok()?;
+                (canonical != *file).then(|| (canonical, functions.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (file, functions) in canonical_files {
+            by_file.entry(file).or_default().extend(functions);
+        }
+        for functions in by_file.values_mut() {
+            functions.sort_unstable();
+            functions.dedup();
+        }
+        Self {
+            functions,
+            by_id,
+            by_name,
+            by_file,
+        }
+    }
+
+    fn get(&self, symbol: &SymbolId) -> Option<&'a FunctionInfo> {
+        self.by_id
+            .get(symbol)
+            .and_then(|index| self.functions.get(*index))
+    }
+
+    fn named(&self, name: &str) -> impl Iterator<Item = &'a FunctionInfo> + '_ {
+        self.by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.functions.get(*index))
+    }
+
+    fn resolve(
+        &self,
+        parts: &[String],
+        caller: &SymbolId,
+        position: Option<&SourceSpan>,
+    ) -> Option<SymbolId> {
+        let name = parts.last()?;
+        let indices = self.by_name.get(name)?;
+        let mut candidates = indices
+            .iter()
+            .filter_map(|index| self.functions.get(*index))
+            .filter(|candidate| {
+                if parts.len() == 1 {
+                    candidate.id.module == caller.module && candidate.id.container.is_none()
+                } else {
+                    let requested_module = &parts[..parts.len() - 1];
+                    candidate.id.container.is_none()
+                        && requested_module.len() <= candidate.id.module.len()
+                        && candidate.id.module[candidate.id.module.len() - requested_module.len()..]
+                            == *requested_module
+                }
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() == 1 {
+            return Some(candidates[0].id.clone());
+        }
+
+        if let Some(position) = position {
+            let same_file = self
+                .functions_in_file(&position.file)
+                .filter(|candidate| candidates.iter().any(|item| item.id == candidate.id))
+                .collect::<Vec<_>>();
+            if !same_file.is_empty() {
+                candidates = same_file;
+                let enclosing_binding = self
+                    .functions_in_file(&position.file)
+                    .filter(|function| {
+                        function.id.container.is_none() && function.span.contains(position)
+                    })
+                    .min_by_key(|function| function.span.extent());
+                let visibility_limit = enclosing_binding
+                    .map_or((position.start_line, position.start_column), |function| {
+                        (function.span.start_line, function.span.start_column)
+                    });
+                candidates.retain(|candidate| {
+                    (candidate.span.start_line, candidate.span.start_column) < visibility_limit
+                });
+                candidates.sort_by_key(|candidate| {
+                    (
+                        candidate.span.start_line,
+                        candidate.span.start_column,
+                        candidate.span.end_line,
+                        candidate.span.end_column,
+                    )
+                });
+                if let Some(candidate) = candidates.last() {
+                    return Some(candidate.id.clone());
+                }
+            }
+        }
+
+        let mut candidates = candidates
+            .into_iter()
+            .map(|candidate| candidate.id.clone())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        (candidates.len() == 1).then(|| candidates.remove(0))
+    }
+
+    fn local_target(&self, target: &CallTarget) -> Option<SymbolId> {
+        let CallTarget::Direct(target) = target else {
+            return None;
+        };
+        if self.by_id.contains_key(target) {
+            return Some(target.clone());
+        }
+        let target_parts = target.qualified_parts();
+        let mut matches = self
+            .functions
+            .iter()
+            .filter(|function| {
+                let parts = function.id.qualified_parts();
+                target_parts.len() <= parts.len()
+                    && parts[parts.len() - target_parts.len()..] == target_parts
+            })
+            .map(|function| function.id.clone())
+            .collect::<Vec<_>>();
+        (matches.len() == 1).then(|| matches.remove(0))
+    }
+
+    fn functions_in_file(&self, file: &Path) -> impl Iterator<Item = &'a FunctionInfo> + '_ {
+        let functions = self.by_file.get(file).or_else(|| {
+            file.canonicalize()
+                .ok()
+                .and_then(|file| self.by_file.get(&file))
+        });
+        functions
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.functions.get(*index))
+    }
+}
+
+struct OcamlFlowIndex<'a> {
+    symbols: OcamlSymbols<'a>,
     parameters: &'a BTreeMap<SymbolId, Vec<OcamlParameterBinding>>,
     return_outcomes: &'a BTreeMap<SymbolId, Vec<String>>,
     module_aliases: &'a BTreeMap<Vec<String>, Vec<String>>,
@@ -1334,12 +1433,14 @@ fn called_ocaml_parameter_index(
     position: Option<&SourceSpan>,
 ) -> Option<usize> {
     bindings.iter().position(|binding| {
-        binding.scope.as_ref().is_none_or(|scope| {
-            position.is_some_and(|position| ocaml_span_contains(scope, position))
-        }) && match binding.kind {
-            OcamlParameterKind::Value => parts.len() == 1 && parts[0] == binding.name,
-            OcamlParameterKind::Module => parts.len() > 1 && parts[0] == binding.name,
-        }
+        binding
+            .scope
+            .as_ref()
+            .is_none_or(|scope| position.is_some_and(|position| scope.contains(position)))
+            && match binding.kind {
+                OcamlParameterKind::Value => parts.len() == 1 && parts[0] == binding.name,
+                OcamlParameterKind::Module => parts.len() > 1 && parts[0] == binding.name,
+            }
     })
 }
 
@@ -1388,9 +1489,7 @@ fn scoped_ocaml_local_value<'a>(
     let candidates = values.get(&(owner.clone(), name.to_owned()))?;
     let mut candidates = candidates
         .iter()
-        .filter(|candidate| {
-            position.is_none_or(|position| ocaml_span_contains(&candidate.scope, position))
-        })
+        .filter(|candidate| position.is_none_or(|position| candidate.scope.contains(position)))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| (candidate.scope.start_line, candidate.scope.start_column));
     candidates.last().copied()
@@ -1410,11 +1509,6 @@ fn position_before_ocaml_scope(scope: &SourceSpan) -> SourceSpan {
     position.start_byte = position.start_byte.map(|byte| byte.saturating_sub(1));
     position.end_byte = position.start_byte;
     position
-}
-
-fn ocaml_span_contains(outer: &SourceSpan, inner: &SourceSpan) -> bool {
-    (outer.start_line, outer.start_column) <= (inner.start_line, inner.start_column)
-        && (inner.end_line, inner.end_column) <= (outer.end_line, outer.end_column)
 }
 
 fn instantiate_ocaml_functors(analysis: &mut FileAnalysis) {
@@ -1636,7 +1730,8 @@ fn resolve_ocaml_function_values(analysis: &mut FileAnalysis) {
 
     // Resolve ordinary local/module calls first. Typedtree paths already in
     // `CallTarget::Direct` remain authoritative.
-    let symbol_index = functions.clone();
+    let symbol_functions = functions.clone();
+    let symbols = OcamlSymbols::new(&symbol_functions);
     for function in &mut functions {
         let parameter_names = parameters.get(&function.id).cloned().unwrap_or_default();
         for call in &mut function.calls {
@@ -1665,12 +1760,8 @@ fn resolve_ocaml_function_values(analysis: &mut FileAnalysis) {
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
                 if let Some(expanded) = expand_ocaml_module_alias(&parts, &module_aliases)
-                    && let Some(resolved) = resolve_ocaml_symbol(
-                        &expanded,
-                        &function.id,
-                        &symbol_index,
-                        Some(&call.span),
-                    )
+                    && let Some(resolved) =
+                        symbols.resolve(&expanded, &function.id, Some(&call.span))
                 {
                     call.target = CallTarget::Direct(resolved);
                     continue;
@@ -1684,9 +1775,7 @@ fn resolve_ocaml_function_values(analysis: &mut FileAnalysis) {
             };
             let expanded =
                 expand_ocaml_module_alias(parts, &module_aliases).unwrap_or_else(|| parts.to_vec());
-            if let Some(target) =
-                resolve_ocaml_symbol(&expanded, &function.id, &symbol_index, Some(&call.span))
-            {
+            if let Some(target) = symbols.resolve(&expanded, &function.id, Some(&call.span)) {
                 call.target = CallTarget::Direct(target);
             }
         }
@@ -1705,7 +1794,8 @@ fn resolve_ocaml_function_values(analysis: &mut FileAnalysis) {
             })
         })
         .collect::<BTreeSet<_>>();
-    let return_called = ocaml_return_called_functions(&functions);
+    let symbols = OcamlSymbols::new(&functions);
+    let return_called = ocaml_return_called_functions(&symbols);
     for (function, outcomes) in &return_outcomes {
         if !return_called.contains(function) {
             continue;
@@ -1718,11 +1808,10 @@ fn resolve_ocaml_function_values(analysis: &mut FileAnalysis) {
         }
     }
 
-    let function_index = functions.clone();
     let mut call_flows = Vec::new();
     for function in &functions {
         for call in &function.calls {
-            let Some(target) = local_target(&call.target, &function_index) else {
+            let Some(target) = symbols.local_target(&call.target) else {
                 continue;
             };
             call_flows.push(OcamlCallFlow {
@@ -1767,7 +1856,7 @@ fn resolve_ocaml_function_values(analysis: &mut FileAnalysis) {
         }
     }
     let flow_index = OcamlFlowIndex {
-        functions: &functions,
+        symbols,
         parameters: &parameters,
         return_outcomes: &return_outcomes,
         module_aliases: &module_aliases,
@@ -1838,8 +1927,9 @@ fn expand_ocaml_module_alias(
     changed.then_some(expanded)
 }
 
-fn ocaml_return_called_functions(functions: &[FunctionInfo]) -> BTreeSet<SymbolId> {
-    functions
+fn ocaml_return_called_functions(symbols: &OcamlSymbols<'_>) -> BTreeSet<SymbolId> {
+    symbols
+        .functions
         .iter()
         .flat_map(|caller| {
             caller.calls.iter().filter_map(|call| {
@@ -1847,18 +1937,14 @@ fn ocaml_return_called_functions(functions: &[FunctionInfo]) -> BTreeSet<SymbolI
                     return None;
                 };
                 let parts = ocaml_applied_function_path(expression)?;
-                resolve_ocaml_symbol(&parts, &caller.id, functions, Some(&call.span))
+                symbols.resolve(&parts, &caller.id, Some(&call.span))
             })
         })
         .collect()
 }
 
 fn ocaml_applied_function_path(expression: &str) -> Option<Vec<String>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_ocaml::LANGUAGE_OCAML.into())
-        .ok()?;
-    let tree = parser.parse(expression, None)?;
+    let tree = parse_ocaml_expression(expression)?;
     if tree.root_node().has_error() {
         return None;
     }
@@ -1901,9 +1987,12 @@ fn specialize_ocaml_function_values(
             incoming[*target] += 1;
         }
         for argument in &call.arguments {
-            if let Some(candidate) =
-                argument_callable_symbol(argument, &call.caller, functions, Some(&call.span))
-                && let Some(target) = index.get(&candidate)
+            if let Some(candidate) = argument_callable_symbol(
+                argument,
+                &call.caller,
+                &flow_index.symbols,
+                Some(&call.span),
+            ) && let Some(target) = index.get(&candidate)
             {
                 incoming[*target] += 1;
             }
@@ -1985,24 +2074,17 @@ fn specialize_ocaml_function_values(
                             })
                         })
                         .collect::<Vec<_>>();
-                    let resolution =
-                        match (candidates.is_empty(), !flow.unresolved_reasons.is_empty()) {
-                            (true, _) => DispatchResolution::Unresolved,
-                            (false, true) => DispatchResolution::Partial,
-                            (false, false) => DispatchResolution::Complete,
-                        };
-                    call.target = CallTarget::Dynamic {
-                        dispatch: SymbolId {
+                    call.target = CallTarget::dynamic(
+                        SymbolId {
                             language: LanguageId::new("ocaml"),
                             module: raw.id.module.clone(),
                             container: Some(raw.id.name.clone()),
                             name: expression.clone(),
                         },
                         candidates,
-                        resolution,
-                        evidence: DispatchEvidence::ExactFlow,
-                        unresolved_reasons: flow.unresolved_reasons,
-                    };
+                        DispatchEvidence::ExactFlow,
+                        flow.unresolved_reasons,
+                    );
                     continue;
                 }
 
@@ -2058,10 +2140,9 @@ fn specialize_ocaml_function_values(
                                 Some(OcamlParameterKind::Module) => {
                                     let mut target_parts = ocaml_module_flow_path(target)?.to_vec();
                                     target_parts.extend_from_slice(&parts[1..]);
-                                    resolve_ocaml_symbol(
+                                    flow_index.symbols.resolve(
                                         &target_parts,
                                         &raw.id,
-                                        functions,
                                         Some(&call.span),
                                     )?
                                 }
@@ -2092,28 +2173,21 @@ fn specialize_ocaml_function_values(
                             })
                         })
                         .collect::<Vec<_>>();
-                    let resolution =
-                        match (candidates.is_empty(), !flow.unresolved_reasons.is_empty()) {
-                            (true, _) => DispatchResolution::Unresolved,
-                            (false, true) => DispatchResolution::Partial,
-                            (false, false) => DispatchResolution::Complete,
-                        };
-                    call.target = CallTarget::Dynamic {
-                        dispatch: SymbolId {
+                    call.target = CallTarget::dynamic(
+                        SymbolId {
                             language: LanguageId::new("ocaml"),
                             module: raw.id.module.clone(),
                             container: Some(raw.id.name.clone()),
                             name: parts.join("."),
                         },
                         candidates,
-                        resolution,
-                        evidence: DispatchEvidence::ExactFlow,
-                        unresolved_reasons: flow.unresolved_reasons,
-                    };
+                        DispatchEvidence::ExactFlow,
+                        flow.unresolved_reasons,
+                    );
                     continue;
                 }
 
-                let Some(target) = local_target(&call.target, functions) else {
+                let Some(target) = flow_index.symbols.local_target(&call.target) else {
                     continue;
                 };
                 let Some(target_index) = index.get(&target).copied() else {
@@ -2559,109 +2633,6 @@ fn split_top_level_ocaml(value: &str, separator: char) -> Vec<&str> {
     result
 }
 
-fn resolve_ocaml_symbol(
-    parts: &[String],
-    caller: &SymbolId,
-    functions: &[FunctionInfo],
-    position: Option<&SourceSpan>,
-) -> Option<SymbolId> {
-    let name = parts.last()?;
-    let mut candidates = functions
-        .iter()
-        .filter(|candidate| {
-            local_callable_source_name(candidate) == name
-                && if parts.len() == 1 {
-                    candidate.id.module == caller.module && candidate.id.container.is_none()
-                } else {
-                    let requested_module = &parts[..parts.len() - 1];
-                    candidate.id.container.is_none()
-                        && requested_module.len() <= candidate.id.module.len()
-                        && candidate.id.module[candidate.id.module.len() - requested_module.len()..]
-                            == *requested_module
-                }
-        })
-        .collect::<Vec<_>>();
-    if candidates.len() == 1 {
-        return Some(candidates[0].id.clone());
-    }
-
-    if let Some(position) = position {
-        let same_file = candidates
-            .iter()
-            .copied()
-            .filter(|candidate| ocaml_source_files_match(&candidate.span.file, &position.file))
-            .collect::<Vec<_>>();
-        if !same_file.is_empty() {
-            candidates = same_file;
-            let enclosing_binding = functions
-                .iter()
-                .filter(|function| {
-                    function.id.container.is_none()
-                        && ocaml_source_files_match(&function.span.file, &position.file)
-                        && ocaml_span_contains(&function.span, position)
-                })
-                .min_by_key(|function| {
-                    (
-                        function
-                            .span
-                            .end_line
-                            .saturating_sub(function.span.start_line),
-                        function
-                            .span
-                            .end_column
-                            .saturating_sub(function.span.start_column),
-                    )
-                });
-            let visibility_limit = enclosing_binding
-                .map_or((position.start_line, position.start_column), |function| {
-                    (function.span.start_line, function.span.start_column)
-                });
-            candidates.retain(|candidate| {
-                (candidate.span.start_line, candidate.span.start_column) < visibility_limit
-            });
-            candidates.sort_by_key(|candidate| {
-                (
-                    candidate.span.start_line,
-                    candidate.span.start_column,
-                    candidate.span.end_line,
-                    candidate.span.end_column,
-                )
-            });
-            if let Some(candidate) = candidates.last() {
-                return Some(candidate.id.clone());
-            }
-        }
-    }
-
-    let mut candidates = candidates
-        .into_iter()
-        .map(|candidate| candidate.id.clone())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    (candidates.len() == 1).then(|| candidates.remove(0))
-}
-
-fn local_target(target: &CallTarget, functions: &[FunctionInfo]) -> Option<SymbolId> {
-    let CallTarget::Direct(target) = target else {
-        return None;
-    };
-    if functions.iter().any(|function| function.id == *target) {
-        return Some(target.clone());
-    }
-    let target_parts = target.qualified_parts();
-    let mut matches = functions
-        .iter()
-        .filter(|function| {
-            let parts = function.id.qualified_parts();
-            target_parts.len() <= parts.len()
-                && parts[parts.len() - target_parts.len()..] == target_parts
-        })
-        .map(|function| function.id.clone())
-        .collect::<Vec<_>>();
-    (matches.len() == 1).then(|| matches.remove(0))
-}
-
 fn argument_callable_flow(
     argument: &str,
     caller: &FunctionInfo,
@@ -2700,7 +2671,7 @@ fn argument_callable_flow(
         return flow;
     }
     if let Some(candidate) =
-        argument_callable_symbol(argument, &caller.id, flow_index.functions, position)
+        argument_callable_symbol(argument, &caller.id, &flow_index.symbols, position)
     {
         return CallableFlow {
             candidates: BTreeSet::from([candidate]),
@@ -2760,11 +2731,7 @@ fn parse_ocaml_callable_flow(
     flow_index: &OcamlFlowIndex<'_>,
     position: Option<&SourceSpan>,
 ) -> Option<CallableFlow> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_ocaml::LANGUAGE_OCAML.into())
-        .ok()?;
-    let tree = parser.parse(expression, None)?;
+    let tree = parse_ocaml_expression(expression)?;
     if tree.root_node().has_error() {
         return None;
     }
@@ -2781,14 +2748,7 @@ fn parse_ocaml_callable_flow(
 
 fn ocaml_callable_outcome_names(expression: &str) -> BTreeSet<String> {
     let expression = normalize_ocaml_callable_argument(expression);
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_ocaml::LANGUAGE_OCAML.into())
-        .is_err()
-    {
-        return BTreeSet::new();
-    }
-    let Some(tree) = parser.parse(expression, None) else {
+    let Some(tree) = parse_ocaml_expression(expression) else {
         return BTreeSet::new();
     };
     if tree.root_node().has_error() {
@@ -2872,7 +2832,7 @@ fn ocaml_callable_node_flow(
         let target = anonymous_callable_symbol_at(
             node_text(node, source),
             &caller.id,
-            flow_index.functions,
+            &flow_index.symbols,
             position,
         )?;
         return Some(CallableFlow {
@@ -2884,8 +2844,7 @@ fn ocaml_callable_node_flow(
         let function = node.child_by_field_name("function")?;
         let parts = ocaml_value_path(function, source)?;
         let arguments = ocaml_application_arguments(node, function, source);
-        let Some(target) = resolve_ocaml_symbol(&parts, &caller.id, flow_index.functions, position)
-        else {
+        let Some(target) = flow_index.symbols.resolve(&parts, &caller.id, position) else {
             let projection = match parts.as_slice() {
                 [name] if name == "fst" => Some(0),
                 [name] if name == "snd" => Some(1),
@@ -2902,10 +2861,7 @@ fn ocaml_callable_node_flow(
                 0,
             );
         };
-        let target_function = flow_index
-            .functions
-            .iter()
-            .find(|function| function.id == target)?;
+        let target_function = flow_index.symbols.get(&target)?;
         let target_context = flow_index
             .parameters
             .get(&target)
@@ -3141,7 +3097,7 @@ fn ocaml_callable_atom_flow(
                 parameter.kind == OcamlParameterKind::Value
                     && parameter.name == argument
                     && parameter.scope.as_ref().is_none_or(|scope| {
-                        position.is_some_and(|position| ocaml_span_contains(scope, position))
+                        position.is_some_and(|position| scope.contains(position))
                     })
             })
         })
@@ -3157,7 +3113,7 @@ fn ocaml_callable_atom_flow(
     if let Some(target) = local_callable_at(
         argument,
         &caller.id,
-        flow_index.functions,
+        &flow_index.symbols,
         flow_index.local_callable_scopes,
         position,
     ) {
@@ -3166,7 +3122,7 @@ fn ocaml_callable_atom_flow(
             unresolved_reasons: BTreeSet::new(),
         });
     }
-    argument_callable_symbol(argument, &caller.id, flow_index.functions, position).map(|target| {
+    argument_callable_symbol(argument, &caller.id, &flow_index.symbols, position).map(|target| {
         CallableFlow {
             candidates: BTreeSet::from([target]),
             unresolved_reasons: BTreeSet::new(),
@@ -3212,11 +3168,7 @@ fn ocaml_record_field_flow(
         );
     }
 
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_ocaml::LANGUAGE_OCAML.into())
-        .ok()?;
-    let tree = parser.parse(record_expression, None)?;
+    let tree = parse_ocaml_expression(record_expression)?;
     if tree.root_node().has_error() {
         return None;
     }
@@ -3309,21 +3261,23 @@ fn merge_callable_flow(destination: &mut CallableFlow, source: CallableFlow) {
 fn argument_callable_symbol(
     argument: &str,
     caller: &SymbolId,
-    functions: &[FunctionInfo],
+    symbols: &OcamlSymbols<'_>,
     position: Option<&SourceSpan>,
 ) -> Option<SymbolId> {
     let argument = normalize_ocaml_callable_argument(argument);
-    if let Some(candidate) = anonymous_callable_symbol(argument, caller, functions) {
+    if let Some(candidate) = anonymous_callable_symbol(argument, caller, symbols) {
         return Some(candidate);
     }
-    if let Some(candidate) = displayed_anonymous_callable_symbol(argument, caller, functions) {
+    if let Some(candidate) =
+        displayed_anonymous_callable_symbol(argument, caller, symbols.functions)
+    {
         return Some(candidate);
     }
     let parts = argument
         .split('.')
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    resolve_ocaml_symbol(&parts, caller, functions, position)
+    symbols.resolve(&parts, caller, position)
 }
 
 fn displayed_anonymous_callable_symbol(
@@ -3355,26 +3309,25 @@ fn displayed_anonymous_callable_symbol(
 fn anonymous_callable_symbol(
     expression: &str,
     caller: &SymbolId,
-    functions: &[FunctionInfo],
+    symbols: &OcamlSymbols<'_>,
 ) -> Option<SymbolId> {
-    anonymous_callable_symbol_at(expression, caller, functions, None)
+    anonymous_callable_symbol_at(expression, caller, symbols, None)
 }
 
 fn anonymous_callable_symbol_at(
     expression: &str,
     caller: &SymbolId,
-    functions: &[FunctionInfo],
+    symbols: &OcamlSymbols<'_>,
     position: Option<&SourceSpan>,
 ) -> Option<SymbolId> {
     let base = anonymous_callable_base(expression)?;
     let direct_owner = caller.to_string();
     let sibling_owner = caller.container.as_deref();
-    let mut candidates = functions
-        .iter()
+    let mut candidates = symbols
+        .named(&base)
         .filter(|candidate| {
-            local_callable_source_name(candidate) == base
-                && (candidate.id.container.as_deref() == Some(direct_owner.as_str())
-                    || candidate.id.container.as_deref() == sibling_owner)
+            candidate.id.container.as_deref() == Some(direct_owner.as_str())
+                || candidate.id.container.as_deref() == sibling_owner
         })
         .map(|candidate| candidate.id.clone())
         .collect::<Vec<_>>();
@@ -3382,10 +3335,9 @@ fn anonymous_callable_symbol_at(
         let positioned = candidates
             .iter()
             .filter(|candidate| {
-                functions
-                    .iter()
-                    .find(|function| function.id == **candidate)
-                    .is_some_and(|function| ocaml_span_contains(position, &function.span))
+                symbols
+                    .get(candidate)
+                    .is_some_and(|function| position.contains(&function.span))
             })
             .cloned()
             .collect::<Vec<_>>();

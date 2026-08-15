@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::model::{CallLabel, CallNode, CallRelation, CallSiteId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,27 +89,32 @@ fn diff_children(before: &[CallNode], after: &[CallNode]) -> Vec<DiffNode> {
             .map(|(before, after)| diff_node(Some(before), Some(after)))
             .collect();
     }
-    let mut score = vec![vec![0usize; m + 1]; n + 1];
+    let before_alignment = before.iter().map(AlignmentNode::new).collect::<Vec<_>>();
+    let after_alignment = after.iter().map(AlignmentNode::new).collect::<Vec<_>>();
+    let width = m + 1;
+    let mut score = vec![0usize; (n + 1).saturating_mul(width)];
 
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            let matched = alignment_weight(&before[i], &after[j])
-                .map(|weight| score[i + 1][j + 1] + weight)
+            let matched = alignment_weight(&before_alignment[i], &after_alignment[j])
+                .map(|weight| score[(i + 1) * width + j + 1] + weight)
                 .unwrap_or_default();
-            score[i][j] = matched.max(score[i + 1][j]).max(score[i][j + 1]);
+            score[i * width + j] = matched
+                .max(score[(i + 1) * width + j])
+                .max(score[i * width + j + 1]);
         }
     }
 
     let mut result = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < n && j < m {
-        let matched =
-            alignment_weight(&before[i], &after[j]).map(|weight| score[i + 1][j + 1] + weight);
-        if matched == Some(score[i][j]) {
+        let matched = alignment_weight(&before_alignment[i], &after_alignment[j])
+            .map(|weight| score[(i + 1) * width + j + 1] + weight);
+        if matched == Some(score[i * width + j]) {
             result.push(diff_node(Some(&before[i]), Some(&after[j])));
             i += 1;
             j += 1;
-        } else if score[i + 1][j] >= score[i][j + 1] {
+        } else if score[(i + 1) * width + j] >= score[i * width + j + 1] {
             result.push(diff_node(Some(&before[i]), None));
             i += 1;
         } else {
@@ -126,7 +133,23 @@ fn diff_children(before: &[CallNode], after: &[CallNode]) -> Vec<DiffNode> {
     result
 }
 
-fn nodes_equivalent(before: &CallNode, after: &CallNode) -> bool {
+struct AlignmentNode<'a> {
+    node: &'a CallNode,
+    key: Cow<'a, str>,
+    label: Cow<'a, str>,
+}
+
+impl<'a> AlignmentNode<'a> {
+    fn new(node: &'a CallNode) -> Self {
+        Self {
+            node,
+            key: normalize_anonymous_lambda_keys(&node.key),
+            label: normalize_anonymous_lambdas(&node.label.default),
+        }
+    }
+}
+
+pub(crate) fn nodes_equivalent(before: &CallNode, after: &CallNode) -> bool {
     semantic_keys_equivalent(&before.key, &after.key)
         && labels_equivalent(&before.label.default, &after.label.default)
         && before.relation == after.relation
@@ -143,23 +166,25 @@ fn nodes_equivalent(before: &CallNode, after: &CallNode) -> bool {
 /// absolute source coordinates, so it must not influence cross-revision
 /// alignment: inserting a line can otherwise pair every repeated call with the
 /// following occurrence.
-fn alignment_weight(before: &CallNode, after: &CallNode) -> Option<usize> {
-    if !semantic_keys_equivalent(&before.key, &after.key) {
+fn alignment_weight(before: &AlignmentNode<'_>, after: &AlignmentNode<'_>) -> Option<usize> {
+    if before.key != after.key {
         return None;
     }
     let mut weight = 10usize;
-    if before.label.default == after.label.default && !before.label.default.contains("λ#") {
+    if before.node.label.default == after.node.label.default
+        && !before.node.label.default.contains("λ#")
+    {
         weight += 100;
-    } else if labels_equivalent(&before.label.default, &after.label.default) {
+    } else if before.label == after.label {
         weight += 80;
     }
-    if before.relation == after.relation {
+    if before.node.relation == after.node.relation {
         weight += 5;
     }
-    if same_shallow_children(before, after) {
+    if same_shallow_children(before.node, after.node) {
         weight += 25;
     }
-    weight += matching_descendant_weight(before, after, 2).min(100);
+    weight += matching_descendant_weight(before.node, after.node, 2).min(100);
     Some(weight)
 }
 
@@ -168,7 +193,10 @@ fn semantic_keys_equivalent(before: &str, after: &str) -> bool {
         || normalize_anonymous_lambda_keys(before) == normalize_anonymous_lambda_keys(after)
 }
 
-fn normalize_anonymous_lambda_keys(key: &str) -> String {
+fn normalize_anonymous_lambda_keys(key: &str) -> Cow<'_, str> {
+    if !key.contains("{lambda:") {
+        return Cow::Borrowed(key);
+    }
     let mut normalized = String::with_capacity(key.len());
     let mut remainder = key;
     while let Some(start) = remainder.find("{lambda:") {
@@ -177,19 +205,22 @@ fn normalize_anonymous_lambda_keys(key: &str) -> String {
         let located = &remainder[start..];
         let Some(end) = located.find('}') else {
             normalized.push_str(located);
-            return normalized;
+            return Cow::Owned(normalized);
         };
         remainder = &located[end + 1..];
     }
     normalized.push_str(remainder);
-    normalized
+    Cow::Owned(normalized)
 }
 
 fn labels_equivalent(before: &str, after: &str) -> bool {
     before == after || normalize_anonymous_lambdas(before) == normalize_anonymous_lambdas(after)
 }
 
-fn normalize_anonymous_lambdas(label: &str) -> String {
+fn normalize_anonymous_lambdas(label: &str) -> Cow<'_, str> {
+    if !label.contains("λ#") {
+        return Cow::Borrowed(label);
+    }
     let mut normalized = String::with_capacity(label.len());
     let mut rest = label;
     while let Some(index) = rest.find("λ#") {
@@ -199,7 +230,7 @@ fn normalize_anonymous_lambdas(label: &str) -> String {
         rest = &rest[digits..];
     }
     normalized.push_str(rest);
-    normalized
+    Cow::Owned(normalized)
 }
 
 fn same_shallow_children(before: &CallNode, after: &CallNode) -> bool {

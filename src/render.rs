@@ -109,7 +109,10 @@ fn render_node(
             DiffStatus::Modified => ("+ ", Some(AnsiColor::Green)),
         };
         lines.push(RenderLine {
-            text: format!("{marker}{indent}{branch_prefix}"),
+            text: format!(
+                "{marker}{indent}{branch_prefix}{}",
+                node.label.text(options.show_types)
+            ),
             color,
             key: None,
             backedge_target: Some(node.key.clone()),
@@ -124,7 +127,7 @@ fn render_node(
                 node.label.text(options.show_types)
             ),
             color: None,
-            key: Some(node.key.clone()),
+            key: backedge_anchor(node),
             backedge_target: None,
         }),
         DiffStatus::Added => lines.push(RenderLine {
@@ -133,7 +136,7 @@ fn render_node(
                 node.label.text(options.show_types)
             ),
             color: Some(AnsiColor::Green),
-            key: Some(node.key.clone()),
+            key: backedge_anchor(node),
             backedge_target: None,
         }),
         DiffStatus::Removed => lines.push(RenderLine {
@@ -142,7 +145,7 @@ fn render_node(
                 node.label.text(options.show_types)
             ),
             color: Some(AnsiColor::Red),
-            key: Some(node.key.clone()),
+            key: backedge_anchor(node),
             backedge_target: None,
         }),
         DiffStatus::Modified => {
@@ -161,7 +164,7 @@ fn render_node(
                     before.text(options.show_types)
                 ),
                 color: Some(AnsiColor::Red),
-                key: Some(node.key.clone()),
+                key: backedge_anchor(node),
                 backedge_target: None,
             });
             lines.push(RenderLine {
@@ -170,7 +173,7 @@ fn render_node(
                     node.label.text(options.show_types)
                 ),
                 color: Some(AnsiColor::Green),
-                key: Some(node.key.clone()),
+                key: backedge_anchor(node),
                 backedge_target: None,
             });
         }
@@ -198,6 +201,10 @@ fn render_node(
             lines,
         );
     }
+}
+
+fn backedge_anchor(node: &DiffNode) -> Option<String> {
+    (!node.children.is_empty()).then(|| node.key.clone())
 }
 
 fn branch(relation: CallRelation, is_last: bool, is_root: bool) -> &'static str {
@@ -241,8 +248,13 @@ fn connect_back_edges(lines: &mut [RenderLine]) {
         .map(|line| line.text.trim_end().chars().collect::<Vec<_>>())
         .collect::<Vec<_>>();
 
-    for (edge_index, (start, end)) in edges.into_iter().enumerate() {
-        let rail = base_rail + edge_index * 3;
+    let mut grouped = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for (start, end) in edges {
+        grouped.entry(start).or_default().push(end);
+    }
+
+    for (rail_index, (start, ends)) in grouped.into_iter().enumerate() {
+        let rail = base_rail + rail_index * 3;
         let arrow = original_lengths[start] + 1;
         set_glyph(&mut rows[start], arrow, '◀');
         for column in arrow + 1..rail {
@@ -250,13 +262,20 @@ fn connect_back_edges(lines: &mut [RenderLine]) {
         }
         set_glyph(&mut rows[start], rail, '┐');
 
-        for row in rows.iter_mut().take(end).skip(start + 1) {
+        let last_end = *ends.last().expect("a back-edge group is never empty");
+        for row in rows.iter_mut().take(last_end).skip(start + 1) {
             set_glyph(row, rail, '│');
         }
-        for column in original_lengths[end]..rail {
-            set_glyph(&mut rows[end], column, '─');
+        for end in ends {
+            for column in original_lengths[end] + 1..rail {
+                set_glyph(&mut rows[end], column, '─');
+            }
+            set_glyph(
+                &mut rows[end],
+                rail,
+                if end == last_end { '┘' } else { '┤' },
+            );
         }
-        set_glyph(&mut rows[end], rail, '┘');
     }
 
     for (line, row) in lines.iter_mut().zip(rows) {
@@ -411,7 +430,7 @@ mod tests {
                 children: vec![CallNode {
                     key: "rust://a".to_owned(),
                     callsite: None,
-                    label: CallLabel::new(""),
+                    label: CallLabel::new("a()"),
                     relation: CallRelation::BackEdge,
                     children: Vec::new(),
                 }],
@@ -426,8 +445,42 @@ mod tests {
                     color: ColorMode::Plain,
                 },
             ),
-            "  a() ◀────┐\n  └─ b()   │\n     └─────┘"
+            "  a() ◀───────┐\n  └─ b()      │\n     └─ a() ──┘"
         );
+    }
+
+    #[test]
+    fn shares_one_rail_between_calls_to_the_same_recursive_ancestor() {
+        let back_edge = |label: &str| CallNode {
+            key: "ocaml://walk".to_owned(),
+            callsite: None,
+            label: CallLabel::new(label),
+            relation: CallRelation::BackEdge,
+            children: Vec::new(),
+        };
+        let tree = CallNode {
+            key: "ocaml://walk".to_owned(),
+            callsite: None,
+            label: CallLabel::new("walk value"),
+            relation: CallRelation::Call,
+            children: vec![
+                back_edge("walk left"),
+                back_edge("walk right"),
+                back_edge("walk tail"),
+            ],
+        };
+
+        let rendered = render_call_tree_with_options(
+            &tree,
+            &RenderOptions {
+                show_types: false,
+                color: ColorMode::Plain,
+            },
+        );
+        assert_eq!(rendered.matches('┐').count(), 1, "{rendered}");
+        assert_eq!(rendered.matches('┤').count(), 2, "{rendered}");
+        assert_eq!(rendered.matches('┘').count(), 1, "{rendered}");
+        assert!(rendered.lines().all(|line| line.chars().count() < 32));
     }
 
     #[test]

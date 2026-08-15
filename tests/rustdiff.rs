@@ -386,6 +386,59 @@ fn dyn_root_without_a_concrete_provenance_is_unresolved() {
 }
 
 #[test]
+fn expands_candidates_only_on_the_last_equivalent_dynamic_call() {
+    let before = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        impl Store for Postgres { fn save(&self) { write(); } }
+        fn run(storage: &dyn Store) {
+            storage.save();
+            storage.save();
+            storage.save();
+        }
+        fn entry() { run(&Postgres); }
+        fn write() {}
+    "#;
+    let after = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        impl Store for Postgres { fn save(&self) { write(); commit(); } }
+        fn run(storage: &dyn Store) {
+            storage.save();
+            storage.save();
+            storage.save();
+        }
+        fn entry() { run(&Postgres); }
+        fn write() {}
+        fn commit() {}
+    "#;
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["entry".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert_eq!(
+        rendered.matches("dyn Store::save()").count(),
+        3,
+        "{rendered}"
+    );
+    assert_eq!(
+        rendered.matches("Postgres::save()").count(),
+        1,
+        "{rendered}"
+    );
+    assert_eq!(rendered.matches("commit()").count(), 1, "{rendered}");
+}
+
+#[test]
 fn dyn_root_with_local_candidates_is_partial_and_keeps_the_unknown_tail() {
     let before = r#"
         trait Store { fn save(&self); }
@@ -689,10 +742,106 @@ fn recursive_calls_render_one_ancestor_and_a_direct_back_edge() {
     )
     .unwrap();
     let rendered = render_plain(&report);
-    assert_eq!(rendered.matches("a()").count(), 1, "{rendered}");
+    assert_eq!(rendered.matches("a()").count(), 2, "{rendered}");
     assert!(rendered.contains('◀'), "{rendered}");
     assert!(rendered.contains('┘'), "{rendered}");
     assert!(rendered.contains("finish()"), "{rendered}");
+}
+
+#[test]
+fn expands_only_the_last_repeated_rust_call_to_the_same_function() {
+    let before = r#"
+        fn leaf(value: i32) {}
+        fn helper(value: i32) { leaf(value); }
+        pub fn run() { helper(1); helper(2); helper(3); }
+    "#;
+    let after = r#"
+        fn leaf(value: i32) {}
+        fn finish(value: i32) {}
+        fn helper(value: i32) { leaf(value); finish(value); }
+        pub fn run() { helper(1); helper(2); helper(3); }
+    "#;
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_plain(&report),
+        "rustdiff before.rs → after.rs\n\n  run()\n  ├─ helper(1)\n  ├─ helper(2)\n  └─ helper(3)\n     ├─ leaf(value)\n+    └─ finish(value)"
+    );
+}
+
+#[test]
+fn moving_the_last_expansion_to_a_new_call_does_not_remove_unchanged_children() {
+    let before = r#"
+        fn leaf(value: i32) {}
+        fn helper(value: i32) { leaf(value); }
+        pub fn run() { helper(1); helper(2); }
+    "#;
+    let after = r#"
+        fn leaf(value: i32) {}
+        fn helper(value: i32) { leaf(value); }
+        pub fn run() { helper(1); helper(2); helper(3); }
+    "#;
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_plain(&report),
+        "rustdiff before.rs → after.rs\n\n  run()\n  ├─ helper(1)\n  ├─ helper(2)\n+ └─ helper(3)"
+    );
+}
+
+#[test]
+fn expands_the_last_call_of_each_concrete_generic_instance() {
+    let before = r#"
+        fn leaf<T>() {}
+        fn helper<T>() { leaf::<T>(); }
+        pub fn run() { helper::<u32>(); helper::<String>(); helper::<u32>(); }
+    "#;
+    let after = r#"
+        fn leaf<T>() {}
+        fn finish<T>() {}
+        fn helper<T>() { leaf::<T>(); finish::<T>(); }
+        pub fn run() { helper::<u32>(); helper::<String>(); helper::<u32>(); }
+    "#;
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert_eq!(rendered.matches("helper<u32>()").count(), 2, "{rendered}");
+    assert_eq!(
+        rendered.matches("helper<String>()").count(),
+        1,
+        "{rendered}"
+    );
+    assert_eq!(rendered.matches("finish<").count(), 2, "{rendered}");
 }
 
 #[test]

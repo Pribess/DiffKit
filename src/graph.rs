@@ -22,6 +22,14 @@ struct Expansion<'a> {
     boundary_marker: Option<&'a str>,
 }
 
+/// Identity of a callee subtree for sibling-call presentation. Every source
+/// call remains visible; only the last equivalent call expands this subtree.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CallExpansionKey {
+    Direct(SymbolId),
+    Dynamic(SymbolId, Vec<SymbolId>, DispatchResolution),
+}
+
 impl ProgramGraph {
     pub fn from_files(files: impl IntoIterator<Item = FileAnalysis>) -> Result<Self, String> {
         let mut graph = Self::default();
@@ -416,7 +424,7 @@ impl ProgramGraph {
             .iter()
             .map(|call| {
                 let dynamic = matches!(call.target, CallTarget::Dynamic { .. });
-                let mut node = self.expand_call(symbol, call, 1, &expansion, &mut visiting);
+                let mut node = self.expand_call(symbol, call, 1, &expansion, true, &mut visiting);
                 if !dynamic {
                     node.children.clear();
                 } else {
@@ -549,16 +557,31 @@ impl ProgramGraph {
             return CallNode {
                 key: symbol.to_string(),
                 callsite: None,
-                label: CallLabel::new(""),
+                label,
                 relation: CallRelation::BackEdge,
                 children: Vec::new(),
             };
         }
 
+        let last_expansions = function
+            .calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, call)| {
+                self.call_expansion_key(symbol, call)
+                    .map(|key| (key, index))
+            })
+            .collect::<BTreeMap<_, _>>();
         let children = function
             .calls
             .iter()
-            .map(|call| self.expand_call(symbol, call, depth + 1, expansion, visiting))
+            .enumerate()
+            .map(|(index, call)| {
+                let expand_target = self
+                    .call_expansion_key(symbol, call)
+                    .is_none_or(|key| last_expansions.get(&key) == Some(&index));
+                self.expand_call(symbol, call, depth + 1, expansion, expand_target, visiting)
+            })
             .collect();
 
         visiting.remove(symbol);
@@ -577,6 +600,7 @@ impl ProgramGraph {
         call: &CallSite,
         depth: usize,
         expansion: &Expansion<'_>,
+        expand_target: bool,
         visiting: &mut HashSet<SymbolId>,
     ) -> CallNode {
         match &call.target {
@@ -593,6 +617,7 @@ impl ProgramGraph {
                     *resolution,
                     depth,
                     expansion,
+                    expand_target,
                     visiting,
                 );
                 node.callsite = Some(call.id.clone());
@@ -605,6 +630,7 @@ impl ProgramGraph {
                     CallRelation::Call,
                     depth,
                     expansion,
+                    expand_target,
                     visiting,
                 );
                 node.callsite = Some(call.id.clone());
@@ -626,6 +652,7 @@ impl ProgramGraph {
                         CallRelation::Call,
                         depth,
                         expansion,
+                        expand_target,
                         visiting,
                     );
                     node.callsite = Some(call.id.clone());
@@ -651,6 +678,7 @@ impl ProgramGraph {
         relation: CallRelation,
         depth: usize,
         expansion: &Expansion<'_>,
+        expand_target: bool,
         visiting: &mut HashSet<SymbolId>,
     ) -> CallNode {
         let can_expand = self.functions.get(&target).is_some_and(|function| {
@@ -663,7 +691,7 @@ impl ProgramGraph {
                     .context
                     .is_some_and(|context| context.contains(&target))
         });
-        if can_expand {
+        if can_expand && expand_target {
             self.expand(&target, Some(label), relation, depth, expansion, visiting)
         } else {
             CallNode {
@@ -685,35 +713,39 @@ impl ProgramGraph {
         resolution: DispatchResolution,
         depth: usize,
         expansion: &Expansion<'_>,
+        expand_target: bool,
         visiting: &mut HashSet<SymbolId>,
     ) -> CallNode {
-        let children =
-            if depth >= expansion.max_depth || resolution == DispatchResolution::Unresolved {
-                Vec::new()
-            } else {
-                candidates
-                    .iter()
-                    .map(|candidate| {
-                        self.expand_direct_call(
-                            candidate.target.clone(),
-                            &candidate.label,
-                            CallRelation::DispatchCandidate,
-                            depth + 1,
-                            expansion,
-                            visiting,
-                        )
-                    })
-                    .chain(
-                        (resolution == DispatchResolution::Partial).then(|| CallNode {
-                            key: format!("{dispatch}#unresolved"),
-                            callsite: None,
-                            label: CallLabel::new("… unresolved targets"),
-                            relation: CallRelation::DispatchCandidate,
-                            children: Vec::new(),
-                        }),
+        let children = if !expand_target
+            || depth >= expansion.max_depth
+            || resolution == DispatchResolution::Unresolved
+        {
+            Vec::new()
+        } else {
+            candidates
+                .iter()
+                .map(|candidate| {
+                    self.expand_direct_call(
+                        candidate.target.clone(),
+                        &candidate.label,
+                        CallRelation::DispatchCandidate,
+                        depth + 1,
+                        expansion,
+                        true,
+                        visiting,
                     )
-                    .collect()
-            };
+                })
+                .chain(
+                    (resolution == DispatchResolution::Partial).then(|| CallNode {
+                        key: format!("{dispatch}#unresolved"),
+                        callsite: None,
+                        label: CallLabel::new("… unresolved targets"),
+                        relation: CallRelation::DispatchCandidate,
+                        children: Vec::new(),
+                    }),
+                )
+                .collect()
+        };
 
         let label = match resolution {
             DispatchResolution::Complete => label.clone(),
@@ -742,6 +774,29 @@ impl ProgramGraph {
                 .resolve_call(caller, &call.syntax)
                 .into_iter()
                 .collect(),
+        }
+    }
+
+    fn call_expansion_key(&self, caller: &SymbolId, call: &CallSite) -> Option<CallExpansionKey> {
+        match &call.target {
+            CallTarget::Direct(target) => Some(CallExpansionKey::Direct(target.clone())),
+            CallTarget::Unresolved => self
+                .resolve_call(caller, &call.syntax)
+                .map(CallExpansionKey::Direct),
+            CallTarget::Dynamic {
+                dispatch,
+                candidates,
+                resolution,
+                ..
+            } => Some(CallExpansionKey::Dynamic(
+                dispatch.clone(),
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.target.clone())
+                    .collect(),
+                *resolution,
+            )),
+            CallTarget::Indirect { .. } => None,
         }
     }
 

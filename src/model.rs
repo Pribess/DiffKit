@@ -193,7 +193,7 @@ impl fmt::Display for UnresolvedReason {
 /// Candidate names are emitted only when the backend has evidence that the
 /// callable value can reach the call site. `Partial` keeps those proven
 /// candidates while recording that another, opaque source may also reach it.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum DispatchResolution {
     #[default]
     Complete,
@@ -298,6 +298,6 @@ pub enum CallRelation {
     DispatchCandidate,
     /// A recursive call to an ancestor already visible in the current tree.
     /// The node key identifies that ancestor; renderers should draw an edge
-    /// back to it rather than repeating its label.
+    /// back to it rather than expanding its body again.
     BackEdge,
 }

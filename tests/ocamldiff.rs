@@ -1,9 +1,14 @@
 #![feature(rustc_private)]
 
+use diffkit::graph::ProgramGraph;
+use diffkit::language::ocaml::OcamlFrontend;
+use diffkit::language::{FileContext, LanguageBackend};
+use diffkit::model::CallRelation;
 use diffkit::{
     ColorMode, DiffOptions, DiffReport, RenderOptions, ocamldiff_sources,
-    render_report_with_options,
+    render_call_tree_with_options, render_report_with_options,
 };
+use std::path::Path;
 
 fn render_plain(report: &DiffReport) -> String {
     render_report_with_options(
@@ -68,6 +73,138 @@ fn preserves_curried_labeled_optional_and_unit_arguments() {
         render_plain(&report),
         "ocamldiff before.ml → after.ml\n\n  run order\n- ├─ charge ~currency:\"KRW\" order 100\n+ ├─ charge ~currency:\"KRW\" order 200\n  ├─ find ?limit:None ~tenant:\"acme\" order\n  └─ commit ()"
     );
+}
+
+#[test]
+fn preserves_repeated_ocaml_call_sites_and_all_arguments() {
+    let before = r#"
+        let touch first second third = ()
+        let run first second third =
+          touch first second third;
+          touch first second third;
+          touch first second third
+    "#;
+    let after = r#"
+        let touch first second third = ()
+        let run first second third =
+          touch first second third;
+          touch first second third;
+          touch first second third;
+          touch first second third
+    "#;
+
+    let report = ocamldiff_sources(
+        "before.ml",
+        before,
+        "after.ml",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_plain(&report),
+        "ocamldiff before.ml → after.ml\n\n  run first second third\n  ├─ touch first second third\n  ├─ touch first second third\n  ├─ touch first second third\n+ └─ touch first second third"
+    );
+}
+
+#[test]
+fn expands_only_the_last_repeated_call_to_the_same_function() {
+    let source = r#"
+        let leaf first second third = ()
+        let touch first second third = leaf first second third
+        let run first second third =
+          touch first second third;
+          touch second third first;
+          touch third first second
+    "#;
+    let path = Path::new("calls.ml");
+    let analysis = OcamlFrontend
+        .analyze_file(&FileContext { path, module: &[] }, source)
+        .unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+
+    assert_eq!(
+        tree.children
+            .iter()
+            .map(|call| call.label.default.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "touch first second third",
+            "touch second third first",
+            "touch third first second",
+        ]
+    );
+    assert!(tree.children[0].children.is_empty());
+    assert!(tree.children[1].children.is_empty());
+    assert_eq!(tree.children[2].children.len(), 1);
+    assert_eq!(
+        tree.children[2].children[0].label.default,
+        "leaf first second third"
+    );
+}
+
+#[test]
+fn connects_only_the_last_repeated_recursive_call_back_to_its_ancestor() {
+    let source = "let rec walk value = walk value; walk value; walk value";
+    let path = Path::new("recursive.ml");
+    let analysis = OcamlFrontend
+        .analyze_file(&FileContext { path, module: &[] }, source)
+        .unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let walk = graph.resolve_entry("walk").unwrap().unwrap();
+    let tree = graph.build_call_tree(&walk, 8).unwrap();
+
+    assert_eq!(tree.children.len(), 3);
+    assert_eq!(tree.children[0].relation, CallRelation::Call);
+    assert_eq!(tree.children[1].relation, CallRelation::Call);
+    assert_eq!(tree.children[2].relation, CallRelation::BackEdge);
+
+    let rendered = render_call_tree_with_options(
+        &tree,
+        &RenderOptions {
+            show_types: false,
+            color: ColorMode::Plain,
+        },
+    );
+    assert!(rendered.lines().next().unwrap().contains('◀'), "{rendered}");
+}
+
+#[test]
+fn keeps_all_arguments_on_recursive_back_edges() {
+    let before = r#"
+        let rec walk left right = walk left right
+    "#;
+    let after = r#"
+        let finish left right = ()
+        let rec walk left right =
+          walk left right;
+          finish left right
+    "#;
+
+    let report = ocamldiff_sources(
+        "before.ml",
+        before,
+        "after.ml",
+        after,
+        &DiffOptions {
+            entries: vec!["walk".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert_eq!(rendered.matches("walk left right").count(), 2, "{rendered}");
+    assert!(rendered.contains("├─ walk left right"), "{rendered}");
+    assert!(rendered.contains("finish left right"), "{rendered}");
+    assert!(rendered.contains('◀'), "{rendered}");
+    assert!(rendered.contains('┘'), "{rendered}");
 }
 
 #[test]

@@ -41,11 +41,19 @@ impl ProgramGraph {
                 if graph.functions.contains_key(&function.id) {
                     return Err(format!("duplicate symbol: {}", function.id));
                 }
-                graph
-                    .functions_by_name
-                    .entry((function.id.language.clone(), function.id.name.clone()))
-                    .or_default()
-                    .insert(function.id.clone());
+                let mut index_names = BTreeSet::from([function.id.name.clone()]);
+                if let Some(leaf) = function.id.name.rsplit("::").next()
+                    && leaf != function.id.name
+                {
+                    index_names.insert(leaf.to_owned());
+                }
+                for name in index_names {
+                    graph
+                        .functions_by_name
+                        .entry((function.id.language.clone(), name))
+                        .or_default()
+                        .insert(function.id.clone());
+                }
                 graph.functions.insert(function.id.clone(), function);
             }
             graph.facts.extend(file.facts);
@@ -267,33 +275,44 @@ impl ProgramGraph {
     pub fn resolve_entries(&self, entry: &str) -> Result<Vec<SymbolId>, String> {
         let normalized_entry = entry.replace('.', "::");
         let match_generic_base = !normalized_entry.contains('<');
-        let mut matches = self
+        let exact = self
             .functions
             .iter()
-            .filter(|(id, function)| {
+            .filter(|(id, _)| {
                 let qualified = id.qualified_parts().join("::");
-                let qualified_context_base = strip_context_suffix(&qualified);
-                let name_context_base = strip_context_suffix(&id.name);
-                let display = callable_prefix(&function.label.default);
                 id.to_string() == entry
                     || id.short_name() == entry
                     || id.name == entry
                     || qualified == normalized_entry
                     || qualified.ends_with(&format!("::{normalized_entry}"))
-                    || display == entry
-                    || display == normalized_entry
-                    || (match_generic_base
-                        && [qualified_context_base, name_context_base, display]
-                            .into_iter()
-                            .flat_map(callable_aliases)
-                            .any(|alias| {
-                                alias == entry
-                                    || alias == normalized_entry
-                                    || alias.ends_with(&format!("::{normalized_entry}"))
-                            }))
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
+        let mut matches = if exact.is_empty() {
+            self.functions
+                .iter()
+                .filter(|(id, function)| {
+                    let qualified = id.qualified_parts().join("::");
+                    let qualified_context_base = strip_context_suffix(&qualified);
+                    let name_context_base = strip_context_suffix(&id.name);
+                    let display = callable_prefix(&function.label.default);
+                    display == entry
+                        || display == normalized_entry
+                        || (match_generic_base
+                            && [qualified_context_base, name_context_base, display]
+                                .into_iter()
+                                .flat_map(callable_aliases)
+                                .any(|alias| {
+                                    alias == entry
+                                        || alias == normalized_entry
+                                        || alias.ends_with(&format!("::{normalized_entry}"))
+                                }))
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            exact
+        };
         matches.sort();
         matches.dedup();
 
@@ -801,9 +820,12 @@ impl ProgramGraph {
     }
 
     fn resolve_call(&self, caller: &SymbolId, call: &CallSyntax) -> Option<SymbolId> {
+        if call.requires_compiler_confirmation() {
+            return None;
+        }
         let mut preferred = Vec::new();
 
-        match call {
+        match call.visible() {
             CallSyntax::SelfMethod(method) => {
                 if let Some(container) = &caller.container {
                     preferred.extend(self.named_symbols(&caller.language, method).filter(
@@ -851,7 +873,7 @@ impl ProgramGraph {
                     ));
                 }
             }
-            CallSyntax::Path(_) => {}
+            CallSyntax::Path(_) | CallSyntax::Expression(_) | CallSyntax::CompilerConfirmed(_) => {}
         }
 
         let preferred = unique(preferred);
@@ -861,13 +883,7 @@ impl ProgramGraph {
         if preferred.len() > 1 {
             return None;
         }
-
-        let name = match call {
-            CallSyntax::Path(parts) => parts.last()?,
-            CallSyntax::SelfMethod(method) | CallSyntax::Method { method, .. } => method,
-        };
-        let fallback = unique(self.named_symbols(&caller.language, name));
-        (fallback.len() == 1).then(|| fallback[0].clone())
+        None
     }
 
     fn named_symbols<'a>(

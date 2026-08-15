@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use proc_macro2::Span;
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use rustc_public::CompilerError;
 use rustc_public::crate_def::CrateDef;
@@ -17,17 +17,19 @@ use rustc_public::mir::{
     StatementKind, TerminatorKind,
 };
 use rustc_public::ty::{
-    AssocContainer, Binder, ExistentialTraitRef, GenericArgKind, GenericArgs, RigidTy, TraitRef,
-    Ty, TyKind, VtblEntry,
+    AssocContainer, Binder, ConstantKind, ExistentialTraitRef, FnDef, GenericArgKind, GenericArgs,
+    RigidTy, TraitRef, Ty, TyKind, UintTy, VtblEntry,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use syn::parse::Parser as SynParser;
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::visit_mut::{self, VisitMut};
 use syn::{
     Expr, ExprCall, ExprClosure, ExprMethodCall, FnArg, ImplItem, Item, ItemFn, ItemImpl,
-    ItemTrait, Pat, ReturnType, Signature, TraitItem, Visibility,
+    ItemTrait, Macro, Pat, ReturnType, Signature, Token, TraitItem, Visibility,
 };
 
 use super::{FileContext, FrontendResult, LanguageBackend, ProjectContext};
@@ -47,7 +49,7 @@ static TEMP_SOURCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RUSTC_CAPTURE_DIRECTORY: &str = "DIFFKIT_RUSTC_CAPTURE_DIRECTORY";
 const RUSTC_ANALYSIS_ROOT: &str = "DIFFKIT_RUSTC_ANALYSIS_ROOT";
 const SNAPSHOT_FINGERPRINT_FILE: &str = ".diffkit-snapshot-key";
-const RUST_SEMANTIC_CACHE_SCHEMA: u32 = 4;
+const RUST_SEMANTIC_CACHE_SCHEMA: u32 = 8;
 
 /// Analyze a standalone, compilable Rust source file with rustc's typed MIR.
 ///
@@ -139,8 +141,17 @@ pub fn run_rustc_wrapper() -> FrontendResult<()> {
             .collect::<Result<Vec<_>, _>>()?,
     );
 
-    let program = match rustc_public::run!(&driver_arguments, || {
-        std::ops::ControlFlow::<(), SemanticProgram>::Continue(collect_instances())
+    let program = match rustc_public::run_with_tcx!(&driver_arguments, |tcx| {
+        if tcx.dcx().has_errors().is_some() {
+            std::ops::ControlFlow::<(), SemanticProgram>::Break(())
+        } else {
+            let (program, expanding_instantiation) = collect_instances();
+            if expanding_instantiation {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(program)
+            }
+        }
     }) {
         Ok(program) => program,
         Err(CompilerError::Failed) => {
@@ -984,6 +995,28 @@ impl Drop for TemporaryRustSource {
     }
 }
 
+struct TemporaryRustOutput {
+    directory: PathBuf,
+}
+
+impl TemporaryRustOutput {
+    fn create() -> std::io::Result<Self> {
+        let sequence = TEMP_SOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "diffkit-rust-output-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory)?;
+        Ok(Self { directory })
+    }
+}
+
+impl Drop for TemporaryRustOutput {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct SemanticProgram {
     crate_name: String,
@@ -1183,12 +1216,31 @@ struct MirCallFlow {
 struct BodyDynAnalysis {
     calls: Vec<Option<MirCallFlow>>,
     return_flow: DynFlow,
+    return_aliases: Vec<ReturnAlias>,
+    return_alias_open: bool,
+    parameter_effects: Vec<DynFlow>,
+    generated_coroutine_flows: HashMap<Instance, DynFlow>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DynSummary {
+    return_flow: DynFlow,
+    return_aliases: Vec<ReturnAlias>,
+    return_alias_open: bool,
+    parameter_effects: Vec<DynFlow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReturnAlias {
+    parameter: usize,
+    projection: Vec<ProjectionElem>,
 }
 
 fn collect_rustc_program(path: &Path) -> FrontendResult<SemanticProgram> {
     let _driver_guard = RUSTC_DRIVER_LOCK
         .lock()
         .map_err(|_| std::io::Error::other("rustc semantic driver lock was poisoned"))?;
+    let output = TemporaryRustOutput::create()?;
     let arguments = vec![
         "rustc".to_owned(),
         path.display().to_string(),
@@ -1196,10 +1248,20 @@ fn collect_rustc_program(path: &Path) -> FrontendResult<SemanticProgram> {
         "--crate-type=lib".to_owned(),
         "--edition=2024".to_owned(),
         "--cap-lints=allow".to_owned(),
+        format!("--out-dir={}", output.directory.display()),
     ];
 
-    match rustc_public::run!(&arguments, || {
-        std::ops::ControlFlow::<SemanticProgram, ()>::Break(collect_instances())
+    match rustc_public::run_with_tcx!(&arguments, |tcx| {
+        if tcx.dcx().has_errors().is_some() {
+            std::ops::ControlFlow::<SemanticProgram, bool>::Continue(false)
+        } else {
+            let (program, expanding_instantiation) = collect_instances();
+            if expanding_instantiation {
+                std::ops::ControlFlow::Continue(true)
+            } else {
+                std::ops::ControlFlow::Break(program)
+            }
+        }
     }) {
         Err(CompilerError::Interrupted(program)) => Ok(program),
         Err(CompilerError::Failed) => Err(std::io::Error::other(format!(
@@ -1211,23 +1273,27 @@ fn collect_rustc_program(path: &Path) -> FrontendResult<SemanticProgram> {
             "rustc skipped semantic analysis before its callback ran",
         )
         .into()),
-        Ok(()) => Err(std::io::Error::other(
+        Ok(true) => Err(std::io::Error::other(
+            "rustc semantic analysis stopped at a recursively expanding generic instantiation",
+        )
+        .into()),
+        Ok(false) => Err(std::io::Error::other(
             "rustc semantic callback unexpectedly completed without analysis",
         )
         .into()),
     }
 }
 
-fn collect_instances() -> SemanticProgram {
+fn collect_instances() -> (SemanticProgram, bool) {
     let crate_name = rustc_public::local_crate().name.to_string();
     let trait_method_implementations = trait_method_implementations();
-    let (instance_bodies, observed_vtables) =
+    let (instance_bodies, observed_vtables, generated_coroutines, expanding_instantiation) =
         collect_instance_bodies(&trait_method_implementations);
     let local_instances = instance_bodies
         .iter()
         .map(|item| item.instance)
         .collect::<HashSet<_>>();
-    let mut return_summaries = HashMap::<Instance, DynFlow>::new();
+    let mut summaries = HashMap::<Instance, DynSummary>::new();
 
     // Return-value summaries remain symbolic in terms of the callee's formal
     // parameters. This lets a trait object cross ordinary helper functions
@@ -1243,11 +1309,31 @@ fn collect_instances() -> SemanticProgram {
     for _ in 0..max_iterations {
         let mut changed = false;
         for item in &instance_bodies {
-            let analysis = analyze_body_dyn_flows(&item.body, &return_summaries, &local_instances);
-            changed |= return_summaries
-                .entry(item.instance)
-                .or_default()
-                .merge(&analysis.return_flow);
+            let analysis = analyze_body_dyn_flows(&item.body, &summaries, &local_instances);
+            let summary = summaries.entry(item.instance).or_default();
+            changed |= summary.return_flow.merge(&analysis.return_flow);
+            for alias in analysis.return_aliases {
+                if !summary.return_aliases.contains(&alias) {
+                    summary.return_aliases.push(alias);
+                    changed = true;
+                }
+            }
+            if analysis.return_alias_open && !summary.return_alias_open {
+                summary.return_alias_open = true;
+                changed = true;
+            }
+            if summary.parameter_effects.len() < analysis.parameter_effects.len() {
+                summary
+                    .parameter_effects
+                    .resize_with(analysis.parameter_effects.len(), DynFlow::default);
+            }
+            for (destination, source) in summary
+                .parameter_effects
+                .iter_mut()
+                .zip(&analysis.parameter_effects)
+            {
+                changed |= destination.merge(source);
+            }
         }
         if !changed {
             summaries_converged = true;
@@ -1257,74 +1343,99 @@ fn collect_instances() -> SemanticProgram {
     if !summaries_converged {
         for item in &instance_bodies {
             if type_contains_dyn(item.body.ret_local().ty) {
-                return_summaries
+                summaries
                     .entry(item.instance)
                     .or_default()
+                    .return_flow
                     .unresolved_reasons
                     .insert(UnresolvedReason::AnalysisLimit);
             }
         }
     }
-
     let mut raw_functions = Vec::new();
+    let folded_coroutines = generated_coroutines
+        .values()
+        .flatten()
+        .copied()
+        .collect::<HashSet<_>>();
+    let bodies_by_instance = instance_bodies
+        .iter()
+        .map(|item| (item.instance, item))
+        .collect::<HashMap<_, _>>();
     for item in &instance_bodies {
+        if folded_coroutines.contains(&item.instance) {
+            continue;
+        }
         let instance = item.instance;
         let body = &item.body;
         let instance_name = stable_instance_name(instance);
-        let analysis = analyze_body_dyn_flows(body, &return_summaries, &local_instances);
         let mut calls = Vec::new();
-        for (block_index, block) in body.blocks.iter().enumerate() {
-            let TerminatorKind::Call { func, args, .. } = &block.terminator.kind else {
-                continue;
-            };
-            let resolved_target = resolve_called_instance(body, func);
-            let definition_name = resolved_target
-                .map(|target| target.def.name())
-                .unwrap_or_default();
-            let call_flow = analysis
-                .calls
-                .get(block_index)
-                .and_then(Option::as_ref)
-                .cloned()
-                .unwrap_or_default();
-            let target = match resolved_target {
-                Some(target) => {
-                    let name = stable_instance_name(target);
-                    match target.kind {
-                        InstanceKind::Virtual { .. } => RawSemanticCallTarget::Dynamic {
-                            dispatch: target,
-                            key: normalize_instance_key(&name),
-                            display: normalize_instance_display(&name, &crate_name),
-                            receiver: call_flow.arguments.first().cloned().unwrap_or_else(|| {
-                                DynFlow::unresolved(UnresolvedReason::AnalysisLimit)
-                            }),
-                        },
-                        _ => RawSemanticCallTarget::Direct {
-                            key: normalize_instance_key(&name),
-                            display: normalize_instance_display(&name, &crate_name),
-                        },
-                    }
+        let logical_bodies = source_logical_instance_bodies(
+            instance,
+            &generated_coroutines,
+            &bodies_by_instance,
+            &summaries,
+            &local_instances,
+        );
+        for logical_item in &logical_bodies {
+            let logical_body = &logical_item.item.body;
+            for (block_index, block) in logical_body.blocks.iter().enumerate() {
+                let TerminatorKind::Call { func, args, .. } = &block.terminator.kind else {
+                    continue;
+                };
+                let resolved_target = resolve_called_instance(logical_body, func);
+                let definition_name = resolved_target
+                    .map(|target| target.def.name())
+                    .unwrap_or_default();
+                let mut call_flow = logical_item
+                    .analysis
+                    .calls
+                    .get(block_index)
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .unwrap_or_default();
+                for flow in &mut call_flow.arguments {
+                    *flow = resolve_symbolic_flow(flow, &logical_item.context);
                 }
-                None => func
-                    .ty(body.locals())
-                    .ok()
-                    .filter(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::FnPtr(_))))
-                    .map(|ty| RawSemanticCallTarget::Indirect {
-                        signature: normalize_type_display(&ty.to_string(), &crate_name),
-                    })
-                    .unwrap_or(RawSemanticCallTarget::Unresolved),
-            };
-            calls.push(RawSemanticCall {
-                target,
-                definition_name,
-                span: rustc_source_span(block.terminator.span),
-                argument_types: args
-                    .iter()
-                    .filter_map(|argument| argument.ty(body.locals()).ok())
-                    .map(|ty| normalize_type_display(&ty.to_string(), &crate_name))
-                    .collect(),
-                argument_flows: call_flow.arguments,
-            });
+                let target = match resolved_target {
+                    Some(target) => {
+                        let name = stable_instance_name(target);
+                        match target.kind {
+                            InstanceKind::Virtual { .. } => RawSemanticCallTarget::Dynamic {
+                                dispatch: target,
+                                key: normalize_instance_key(&name),
+                                display: normalize_instance_display(&name, &crate_name),
+                                receiver: call_flow.arguments.first().cloned().unwrap_or_else(
+                                    || DynFlow::unresolved(UnresolvedReason::AnalysisLimit),
+                                ),
+                            },
+                            _ => RawSemanticCallTarget::Direct {
+                                key: normalize_instance_key(&name),
+                                display: normalize_instance_display(&name, &crate_name),
+                            },
+                        }
+                    }
+                    None => func
+                        .ty(logical_body.locals())
+                        .ok()
+                        .filter(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::FnPtr(_))))
+                        .map(|ty| RawSemanticCallTarget::Indirect {
+                            signature: normalize_type_display(&ty.to_string(), &crate_name),
+                        })
+                        .unwrap_or(RawSemanticCallTarget::Unresolved),
+                };
+                calls.push(RawSemanticCall {
+                    target,
+                    definition_name,
+                    span: rustc_source_span(block.terminator.span),
+                    argument_types: args
+                        .iter()
+                        .filter_map(|argument| argument.ty(logical_body.locals()).ok())
+                        .map(|ty| normalize_type_display(&ty.to_string(), &crate_name))
+                        .collect(),
+                    argument_flows: call_flow.arguments,
+                });
+            }
         }
         calls.sort_by_key(|call| {
             (
@@ -1334,16 +1445,15 @@ fn collect_instances() -> SemanticProgram {
                 call.span.end_column,
             )
         });
-        let mut constructor_spans = body
-            .blocks
+        let mut constructor_spans = logical_bodies
             .iter()
+            .flat_map(|item| &item.item.body.blocks)
             .flat_map(|block| &block.statements)
             .filter_map(|statement| {
                 let StatementKind::Assign(_, value) = &statement.kind else {
                     return None;
                 };
-                let ty = value.ty(body.locals()).ok()?;
-                matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(..)))
+                matches!(value, Rvalue::Aggregate(AggregateKind::Adt(..), _))
                     .then(|| rustc_source_span(statement.span))
             })
             .collect::<Vec<_>>();
@@ -1357,8 +1467,15 @@ fn collect_instances() -> SemanticProgram {
         });
         constructor_spans.dedup();
         let mut constructor_names = HashSet::new();
-        for local in body.locals() {
-            collect_adt_constructor_names(local.ty, &mut constructor_names);
+        let mut visited_constructor_types = HashSet::new();
+        for logical_item in logical_bodies {
+            for local in logical_item.item.body.locals() {
+                collect_adt_constructor_names(
+                    local.ty,
+                    &mut constructor_names,
+                    &mut visited_constructor_types,
+                );
+            }
         }
         let mut constructor_names = constructor_names.into_iter().collect::<Vec<_>>();
         constructor_names.sort();
@@ -1385,26 +1502,38 @@ fn collect_instances() -> SemanticProgram {
         &crate_name,
     );
     functions.sort_by(|left, right| left.key.cmp(&right.key));
-    SemanticProgram {
-        crate_name,
-        functions,
-    }
+    (
+        SemanticProgram {
+            crate_name,
+            functions,
+        },
+        expanding_instantiation,
+    )
 }
 
 fn collect_instance_bodies(
     trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
-) -> (Vec<InstanceBody>, Vec<TraitRef>) {
+) -> (
+    Vec<InstanceBody>,
+    Vec<TraitRef>,
+    HashMap<Instance, Vec<Instance>>,
+    bool,
+) {
     let mut queue = rustc_public::all_local_items()
         .into_iter()
         .filter(|item| matches!(item.kind(), rustc_public::ItemKind::Fn))
         .filter_map(|item| Instance::try_from(item).ok())
+        .map(|instance| (instance, HashMap::new()))
         .collect::<VecDeque<_>>();
     let mut visited = HashSet::new();
     let mut bodies = Vec::new();
     let mut observed_vtables = Vec::<TraitRef>::new();
+    let mut observed_vtable_keys = HashSet::new();
+    let mut generated_coroutines = HashMap::<Instance, Vec<Instance>>::new();
+    let mut expanding_instantiation = false;
 
     loop {
-        while let Some(instance) = queue.pop_front() {
+        while let Some((instance, history)) = queue.pop_front() {
             if !visited.insert(instance) {
                 continue;
             }
@@ -1412,15 +1541,33 @@ fn collect_instance_bodies(
                 continue;
             };
 
-            let mut local_vtables = Vec::new();
-            collect_observed_vtables(&body, &mut local_vtables);
-            for vtable in local_vtables {
-                if !observed_vtables.contains(&vtable) {
-                    observed_vtables.push(vtable);
-                }
-            }
+            collect_observed_vtables(&body, &mut observed_vtables, &mut observed_vtable_keys);
 
             for block in &body.blocks {
+                for statement in &block.statements {
+                    let StatementKind::Assign(_, Rvalue::Aggregate(kind, _)) = &statement.kind
+                    else {
+                        continue;
+                    };
+                    let AggregateKind::Coroutine(definition, arguments) = kind else {
+                        continue;
+                    };
+                    if let Ok(generated) = Instance::resolve(FnDef(definition.def_id()), arguments)
+                        && generated.has_body()
+                    {
+                        enqueue_rust_instance(
+                            &mut queue,
+                            generated,
+                            &history,
+                            &visited,
+                            &mut expanding_instantiation,
+                        );
+                        let children = generated_coroutines.entry(instance).or_default();
+                        if !children.contains(&generated) {
+                            children.push(generated);
+                        }
+                    }
+                }
                 let TerminatorKind::Call {
                     func,
                     args,
@@ -1439,7 +1586,13 @@ fn collect_instance_bodies(
                         || instance_body_is_in_analysis_root(target)
                         || call_boundary_contains_dyn(&body, args, destination))
                 {
-                    queue.push_back(target);
+                    enqueue_rust_instance(
+                        &mut queue,
+                        target,
+                        &history,
+                        &visited,
+                        &mut expanding_instantiation,
+                    );
                 }
             }
             bodies.push(InstanceBody { instance, body });
@@ -1457,7 +1610,7 @@ fn collect_instance_bodies(
                     continue;
                 }
                 for trait_ref in &observed_vtables {
-                    let Some(candidate) = resolve_dispatch_candidate(
+                    let Some(candidate) = resolve_observed_dispatch_candidate(
                         dispatch,
                         trait_ref,
                         trait_method_implementations,
@@ -1465,7 +1618,13 @@ fn collect_instance_bodies(
                         continue;
                     };
                     if candidate.has_body() && !visited.contains(&candidate) {
-                        queue.push_back(candidate);
+                        enqueue_rust_instance(
+                            &mut queue,
+                            candidate,
+                            &HashMap::new(),
+                            &visited,
+                            &mut expanding_instantiation,
+                        );
                     }
                 }
             }
@@ -1474,7 +1633,137 @@ fn collect_instance_bodies(
             break;
         }
     }
-    (bodies, observed_vtables)
+    (
+        bodies,
+        observed_vtables,
+        generated_coroutines,
+        expanding_instantiation,
+    )
+}
+
+const MAX_GROWING_INSTANCE_CHAIN: usize = 8;
+const MAX_NAMED_INSTANCE_RECURSION: usize = 8;
+const MAX_GENERATED_INSTANCE_RECURSION: usize = 64;
+
+type InstanceExpansionHistory = HashMap<rustc_public::DefId, (usize, usize, usize)>;
+
+fn enqueue_rust_instance(
+    queue: &mut VecDeque<(Instance, InstanceExpansionHistory)>,
+    instance: Instance,
+    history: &InstanceExpansionHistory,
+    visited: &HashSet<Instance>,
+    expanding_instantiation: &mut bool,
+) {
+    if visited.contains(&instance) {
+        return;
+    }
+    let definition = instance.def.def_id();
+    let size = instance.name().as_str().len();
+    let (growth, recursion) =
+        history
+            .get(&definition)
+            .map_or((0, 0), |(previous, growth, recursion)| {
+                (
+                    usize::from(size > *previous).saturating_add(*growth),
+                    recursion.saturating_add(1),
+                )
+            });
+    let definition_name = instance.def.name();
+    let definition_name = definition_name.as_str();
+    let recursion_limit = if definition_name.contains("{closure")
+        || definition_name.contains("{async")
+        || definition_name.contains("{coroutine")
+    {
+        MAX_GENERATED_INSTANCE_RECURSION
+    } else {
+        MAX_NAMED_INSTANCE_RECURSION
+    };
+    if growth >= MAX_GROWING_INSTANCE_CHAIN || recursion >= recursion_limit {
+        *expanding_instantiation = true;
+        return;
+    }
+    let mut next_history = history.clone();
+    next_history.insert(definition, (size, growth, recursion));
+    queue.push_back((instance, next_history));
+}
+
+struct SourceLogicalInstanceBody<'a> {
+    item: &'a InstanceBody,
+    analysis: BodyDynAnalysis,
+    context: Vec<DynFlow>,
+}
+
+fn source_logical_instance_bodies<'a>(
+    root: Instance,
+    generated_coroutines: &HashMap<Instance, Vec<Instance>>,
+    bodies: &HashMap<Instance, &'a InstanceBody>,
+    summaries: &HashMap<Instance, DynSummary>,
+    analyzed_instances: &HashSet<Instance>,
+) -> Vec<SourceLogicalInstanceBody<'a>> {
+    let Some(root_body) = bodies.get(&root) else {
+        return Vec::new();
+    };
+    let root_context: Vec<DynFlow> = root_body
+        .body
+        .arg_locals()
+        .iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            if type_contains_dyn(argument.ty) || type_may_hide_dyn_provenance(argument.ty) {
+                DynFlow::parameter(index)
+            } else {
+                DynFlow::default()
+            }
+        })
+        .collect();
+    let mut pending: VecDeque<(Instance, Vec<DynFlow>)> = VecDeque::from([(root, root_context)]);
+    let mut visited = HashSet::new();
+    let mut result = Vec::new();
+    while let Some((instance, context)) = pending.pop_front() {
+        if !visited.insert(instance) {
+            continue;
+        }
+        let Some(item) = bodies.get(&instance).copied() else {
+            continue;
+        };
+        let analysis = analyze_body_dyn_flows(&item.body, summaries, analyzed_instances);
+        if let Some(children) = generated_coroutines.get(&instance) {
+            for child in children {
+                let Some(child_body) = bodies.get(child) else {
+                    continue;
+                };
+                let captured = analysis
+                    .generated_coroutine_flows
+                    .get(child)
+                    .cloned()
+                    .unwrap_or_else(|| DynFlow::unresolved(UnresolvedReason::AnalysisLimit));
+                let child_context: Vec<DynFlow> = child_body
+                    .body
+                    .arg_locals()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, argument)| {
+                        if !type_contains_dyn(argument.ty)
+                            && !type_may_hide_dyn_provenance(argument.ty)
+                        {
+                            DynFlow::default()
+                        } else if index == 0 {
+                            resolve_symbolic_flow(&captured, &context)
+                        } else {
+                            DynFlow::unresolved(UnresolvedReason::AnalysisLimit)
+                        }
+                    })
+                    .collect();
+                pending.push_back((*child, child_context));
+            }
+        }
+        result.push(SourceLogicalInstanceBody {
+            item,
+            analysis,
+            context,
+        });
+    }
+    result
 }
 
 fn instance_body_is_in_analysis_root(instance: Instance) -> bool {
@@ -1501,7 +1790,11 @@ fn call_boundary_contains_dyn(body: &Body, arguments: &[Operand], destination: &
         || destination.ty(body.locals()).is_ok_and(type_contains_dyn)
 }
 
-fn collect_observed_vtables(body: &rustc_public::mir::Body, observed: &mut Vec<TraitRef>) {
+fn collect_observed_vtables(
+    body: &rustc_public::mir::Body,
+    observed: &mut Vec<TraitRef>,
+    seen: &mut HashSet<(rustc_public::ty::TraitDef, GenericArgs)>,
+) {
     for block in &body.blocks {
         for statement in &block.statements {
             let StatementKind::Assign(
@@ -1529,7 +1822,7 @@ fn collect_observed_vtables(body: &rustc_public::mir::Body, observed: &mut Vec<T
             }
             let principal = principal.value;
             let trait_ref = TraitRef::new(principal.def_id, concrete_ty, &principal.generic_args);
-            if !observed.contains(&trait_ref) {
+            if seen.insert((trait_ref.def_id, trait_ref.args().clone())) {
                 observed.push(trait_ref);
             }
         }
@@ -1539,10 +1832,15 @@ fn collect_observed_vtables(body: &rustc_public::mir::Body, observed: &mut Vec<T
 fn dyn_coercion(source: Ty, target: Ty) -> Option<(Ty, Binder<ExistentialTraitRef>)> {
     let target_kind = target.kind();
     if let Some(principal) = target_kind.trait_principal() {
+        if let TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) =
+            source.kind()
+        {
+            return dyn_coercion(inner, target);
+        }
         // A trait upcast (`dyn Child` -> `dyn Parent`) does not reveal a
         // concrete implementation. Only thin-to-wide coercions contribute an
         // concrete receiver-flow candidate here.
-        return (!source.kind().is_trait()).then_some((source, principal));
+        return (!type_contains_dyn(source)).then_some((source, principal));
     }
 
     match (source.kind(), target_kind) {
@@ -1590,35 +1888,109 @@ fn resolve_called_instance(body: &Body, operand: &Operand) -> Option<Instance> {
 fn resolve_dispatch_candidate(
     dispatch: Instance,
     trait_ref: &TraitRef,
-    trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
+    _trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
 ) -> Option<Instance> {
     let InstanceKind::Virtual { idx } = dispatch.kind else {
         return None;
     };
-    let VtblEntry::Method(candidate) = trait_ref.vtable_entry(idx)? else {
+    if type_contains_dyn(trait_ref.self_ty()) {
+        return None;
+    }
+    let dispatch_arguments = dispatch.args();
+    let receiver = dispatch_arguments.0.first()?.ty()?;
+    let principal = dynamic_principal(*receiver)?;
+    if !principal.bound_vars.is_empty() {
+        return None;
+    }
+    let principal = principal.value;
+    let dispatch_ref = TraitRef::new(
+        principal.def_id,
+        trait_ref.self_ty(),
+        &principal.generic_args,
+    );
+    let VtblEntry::Method(candidate) = dispatch_ref.vtable_entry(idx)? else {
         return None;
     };
+    Some(candidate)
+}
+
+fn dispatch_principal_matches_observed_vtable(dispatch: Instance, observed: &TraitRef) -> bool {
+    dispatch
+        .args()
+        .0
+        .first()
+        .and_then(GenericArgKind::ty)
+        .and_then(|receiver| dynamic_principal(*receiver))
+        .is_some_and(|principal| {
+            principal.bound_vars.is_empty() && principal.value.def_id == observed.def_id
+        })
+}
+
+fn resolve_observed_dispatch_candidate(
+    dispatch: Instance,
+    observed: &TraitRef,
+    trait_method_implementations: &HashMap<rustc_public::DefId, rustc_public::DefId>,
+) -> Option<Instance> {
+    if dispatch_principal_matches_observed_vtable(dispatch, observed) {
+        return resolve_dispatch_candidate(dispatch, observed, trait_method_implementations);
+    }
     let trait_method = dispatch.def.def_id();
-    let candidate_method = candidate.def.def_id();
-    (candidate_method == trait_method
-        || trait_method_implementations.get(&candidate_method) == Some(&trait_method))
-    .then_some(candidate)
+    observed.vtable_entries().into_iter().find_map(|entry| {
+        let VtblEntry::Method(candidate) = entry else {
+            return None;
+        };
+        let candidate_method = candidate.def.def_id();
+        (candidate_method == trait_method
+            || trait_method_implementations.get(&candidate_method) == Some(&trait_method))
+        .then_some(candidate)
+    })
+}
+
+fn dynamic_principal(ty: Ty) -> Option<Binder<ExistentialTraitRef>> {
+    let kind = ty.kind();
+    if let Some(principal) = kind.trait_principal() {
+        return Some(principal);
+    }
+    match kind {
+        TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => {
+            dynamic_principal(inner)
+        }
+        TyKind::RigidTy(RigidTy::Adt(_, arguments)) => arguments
+            .0
+            .iter()
+            .filter_map(GenericArgKind::ty)
+            .find_map(|ty| dynamic_principal(*ty)),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Default)]
 struct DynState {
     flows: HashMap<Place, DynFlow>,
     aliases: HashMap<Place, Vec<Place>>,
+    /// Aliases inferred across an opaque external boundary. Reads can retain
+    /// the known incoming candidates, but a write through one cannot soundly
+    /// be attributed to a particular source place.
+    uncertain_aliases: HashSet<Place>,
+    constant_indices: HashMap<usize, u64>,
+    /// Places initialized by MIR even when their exact dynamic candidate set
+    /// is empty (for example `Vec::new()`). Absence from `flows` alone cannot
+    /// distinguish known-empty state from opaque memory.
+    known: HashSet<Place>,
 }
 
 fn analyze_body_dyn_flows(
     body: &Body,
-    return_summaries: &HashMap<Instance, DynFlow>,
-    local_instances: &HashSet<Instance>,
+    summaries: &HashMap<Instance, DynSummary>,
+    analyzed_instances: &HashSet<Instance>,
 ) -> BodyDynAnalysis {
     let mut result = BodyDynAnalysis {
         calls: vec![None; body.blocks.len()],
         return_flow: DynFlow::default(),
+        return_aliases: Vec::new(),
+        return_alias_open: false,
+        parameter_effects: vec![DynFlow::default(); body.arg_locals().len()],
+        generated_coroutine_flows: HashMap::new(),
     };
     if body.blocks.is_empty() {
         return result;
@@ -1626,7 +1998,7 @@ fn analyze_body_dyn_flows(
 
     let mut entry = DynState::default();
     for (index, argument) in body.arg_locals().iter().enumerate() {
-        if type_contains_dyn(argument.ty) {
+        if type_contains_dyn(argument.ty) || type_may_hide_dyn_provenance(argument.ty) {
             entry
                 .flows
                 .insert(Place::from(index + 1), DynFlow::parameter(index));
@@ -1654,7 +2026,13 @@ fn analyze_body_dyn_flows(
         };
         let block = &body.blocks[block_index];
         for statement in &block.statements {
-            transfer_dyn_statement(body, &mut state, statement);
+            transfer_dyn_statement(
+                body,
+                &mut state,
+                statement,
+                &mut result.parameter_effects,
+                &mut result.generated_coroutine_flows,
+            );
         }
 
         match &block.terminator.kind {
@@ -1665,6 +2043,7 @@ fn analyze_body_dyn_flows(
                 target,
                 ..
             } => {
+                let resolved = resolve_called_instance(body, func);
                 let argument_flows = args
                     .iter()
                     .map(|argument| dyn_flow_for_operand(body, &state, argument))
@@ -1676,23 +2055,14 @@ fn analyze_body_dyn_flows(
                     },
                 );
 
-                let destination_flow = resolve_called_instance(body, func).map_or_else(
+                let destination_flow = resolved.map_or_else(
                     || unknown_if_dyn_place(body, destination, UnresolvedReason::ExternalCode),
                     |callee| {
                         if matches!(callee.kind, InstanceKind::Virtual { .. }) {
                             unknown_if_dyn_place(body, destination, UnresolvedReason::ExternalCode)
-                        } else if let Some(summary) = return_summaries.get(&callee) {
-                            let mut flow = resolve_symbolic_flow(summary, &argument_flows);
-                            if !callee.def.krate().is_local {
-                                flow.merge(&external_return_flow(
-                                    body,
-                                    args,
-                                    destination,
-                                    &argument_flows,
-                                ));
-                            }
-                            flow
-                        } else if local_instances.contains(&callee) {
+                        } else if let Some(summary) = summaries.get(&callee) {
+                            resolve_symbolic_flow(&summary.return_flow, &argument_flows)
+                        } else if analyzed_instances.contains(&callee) {
                             DynFlow::default()
                         } else {
                             external_return_flow(body, args, destination, &argument_flows)
@@ -1700,19 +2070,46 @@ fn analyze_body_dyn_flows(
                     },
                 );
 
-                apply_external_memory_effects(
-                    body,
+                apply_call_memory_effects(
                     &mut state,
-                    func,
+                    CallMemoryInputs {
+                        body,
+                        arguments: args,
+                        resolved,
+                        argument_flows: &argument_flows,
+                        summaries,
+                        analyzed_instances,
+                    },
+                    &mut result.parameter_effects,
+                );
+
+                let returned_alias = returned_call_alias(
+                    body,
+                    &state,
                     args,
-                    resolve_called_instance(body, func),
-                    &argument_flows,
+                    destination,
+                    resolved,
+                    summaries,
+                    analyzed_instances,
                 );
 
                 for successor in block.terminator.successors() {
                     let mut outgoing = state.clone();
                     if Some(successor) == *target {
+                        if destination.projection.is_empty() {
+                            outgoing.constant_indices.remove(&destination.local);
+                        }
                         write_dyn_place(&mut outgoing, destination, destination_flow.clone());
+                        if let Some(alias) = &returned_alias {
+                            outgoing
+                                .aliases
+                                .insert(destination.clone(), alias.targets.clone());
+                            if alias.uncertain {
+                                outgoing.uncertain_aliases.insert(destination.clone());
+                            } else {
+                                outgoing.uncertain_aliases.remove(destination);
+                            }
+                        }
                     }
                     if merge_dyn_state(&mut incoming[successor], &outgoing) {
                         pending.push_back(successor);
@@ -1720,8 +2117,40 @@ fn analyze_body_dyn_flows(
                 }
             }
             TerminatorKind::Return => {
-                let flow = read_dyn_place(&state, &Place::from(0));
+                let return_place = Place::from(0);
+                let flow = read_dyn_place(&state, &return_place);
                 result.return_flow.merge(&flow);
+                let targets = resolve_alias_places(&state, &return_place);
+                if place_alias_is_uncertain(&state, &return_place) {
+                    result.return_alias_open = true;
+                }
+                for target in targets {
+                    if target.local == 0 {
+                        let rendered_return = body.ret_local().ty.to_string();
+                        result.return_alias_open |= rendered_return.starts_with('&')
+                            || rendered_return.starts_with("*const ")
+                            || rendered_return.starts_with("*mut ");
+                        continue;
+                    }
+                    if target.local > body.arg_locals().len() {
+                        result.return_alias_open = true;
+                        continue;
+                    }
+                    let mut projection = target.projection.clone();
+                    if projection
+                        .first()
+                        .is_some_and(|element| matches!(element, ProjectionElem::Deref))
+                    {
+                        projection.remove(0);
+                    }
+                    let alias = ReturnAlias {
+                        parameter: target.local - 1,
+                        projection,
+                    };
+                    if !result.return_aliases.contains(&alias) {
+                        result.return_aliases.push(alias);
+                    }
+                }
             }
             _ => {
                 for successor in block.terminator.successors() {
@@ -1753,22 +2182,167 @@ fn external_return_flow(
     flow
 }
 
-/// Model memory that crosses a call boundary as an abstract region attached
-/// to the referenced MIR place. This is type-directed: it does not name Vec,
-/// Arc, HashMap, or individual methods. Opaque external behavior remains in
-/// the unresolved-reason set, while concrete values that cross that same
-/// boundary remain available as partial evidence instead of being lost.
-fn apply_external_memory_effects(
+struct ReturnedCallAlias {
+    targets: Vec<Place>,
+    uncertain: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn returned_call_alias(
     body: &Body,
-    state: &mut DynState,
-    _function: &Operand,
+    state: &DynState,
     arguments: &[Operand],
+    destination: &Place,
     resolved: Option<Instance>,
-    argument_flows: &[DynFlow],
+    summaries: &HashMap<Instance, DynSummary>,
+    analyzed_instances: &HashSet<Instance>,
+) -> Option<ReturnedCallAlias> {
+    let destination_ty = destination.ty(body.locals()).ok()?;
+    let rendered_destination = destination_ty.to_string();
+    let direct_reference = rendered_destination.starts_with('&')
+        || rendered_destination.starts_with("*const ")
+        || rendered_destination.starts_with("*mut ");
+    let borrowed_container = type_may_borrow_dyn(destination_ty);
+    if !direct_reference && !borrowed_container {
+        return None;
+    }
+
+    let summary = resolved.and_then(|callee| summaries.get(&callee));
+    let (sources, mut uncertain) = if let Some(summary) = summary {
+        let sources = if direct_reference {
+            let mut sources = summary.return_aliases.clone();
+            for parameter in &summary.return_flow.parameters {
+                if !sources.iter().any(|source| source.parameter == *parameter) {
+                    sources.push(ReturnAlias {
+                        parameter: *parameter,
+                        projection: Vec::new(),
+                    });
+                }
+            }
+            sources
+        } else if borrowed_container {
+            summary
+                .return_flow
+                .parameters
+                .iter()
+                .map(|parameter| ReturnAlias {
+                    parameter: *parameter,
+                    projection: Vec::new(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if sources.is_empty() {
+            return None;
+        }
+        (
+            sources,
+            !direct_reference
+                || (summary.return_alias_open
+                    && (summary.return_flow.parameters.is_empty()
+                        || !summary.return_flow.concrete.is_empty()
+                        || !summary.return_flow.unresolved_reasons.is_empty())),
+        )
+    } else {
+        if resolved.is_some_and(|callee| analyzed_instances.contains(&callee)) {
+            return None;
+        }
+        (
+            arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(index, argument)| {
+                    argument
+                        .ty(body.locals())
+                        .is_ok_and(|ty| type_contains_dyn(ty) || type_may_hide_dyn_provenance(ty))
+                        .then_some(ReturnAlias {
+                            parameter: index,
+                            projection: Vec::new(),
+                        })
+                })
+                .collect(),
+            true,
+        )
+    };
+
+    let mut targets = Vec::new();
+    for source in sources {
+        let Some(place) = arguments.get(source.parameter).and_then(operand_place) else {
+            continue;
+        };
+        uncertain |= place_alias_is_uncertain(state, place);
+        for mut target in resolve_alias_places(state, place) {
+            target.projection.extend(source.projection.iter().cloned());
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    (!targets.is_empty()).then_some(ReturnedCallAlias { targets, uncertain })
+}
+
+fn type_may_borrow_dyn(ty: Ty) -> bool {
+    if !type_contains_dyn(ty) {
+        return false;
+    }
+    let rendered = ty.to_string();
+    rendered.starts_with('&')
+        || rendered.starts_with("*const ")
+        || rendered.starts_with("*mut ")
+        || rendered.contains("<'_,")
+        || rendered.contains("<'_, ")
+}
+
+/// Apply a callee's symbolic writes to the caller's MIR places. Effects are
+/// expressed in terms of formal parameters, so this works for standard and
+/// user-defined containers without method-name contracts. Only a call whose
+/// body was unavailable falls back to an opaque boundary.
+struct CallMemoryInputs<'a> {
+    body: &'a Body,
+    arguments: &'a [Operand],
+    resolved: Option<Instance>,
+    argument_flows: &'a [DynFlow],
+    summaries: &'a HashMap<Instance, DynSummary>,
+    analyzed_instances: &'a HashSet<Instance>,
+}
+
+fn apply_call_memory_effects(
+    state: &mut DynState,
+    inputs: CallMemoryInputs<'_>,
+    caller_effects: &mut [DynFlow],
 ) {
-    if resolved.is_some_and(|callee| callee.def.krate().is_local) {
+    let CallMemoryInputs {
+        body,
+        arguments,
+        resolved,
+        argument_flows,
+        summaries,
+        analyzed_instances,
+    } = inputs;
+    if let Some(summary) = resolved.and_then(|callee| summaries.get(&callee)) {
+        for (index, effect) in summary.parameter_effects.iter().enumerate() {
+            if effect.is_empty() {
+                continue;
+            }
+            let resolved_effect = resolve_symbolic_flow(effect, argument_flows);
+            let Some(argument) = arguments.get(index) else {
+                continue;
+            };
+            if let Some(place) = operand_place(argument) {
+                merge_dyn_place(state, place, &resolved_effect);
+            }
+            propagate_region_effect(argument_flows.get(index), &resolved_effect, caller_effects);
+        }
         return;
     }
+    if resolved.is_some_and(|callee| analyzed_instances.contains(&callee)) {
+        // The fixed point has not reached this analyzed callee yet. Adding an
+        // opaque reason here would be irreversible in the monotone lattice and
+        // would leave a false `[partial]` after its exact summary arrives.
+        return;
+    }
+
     let mut stored = DynFlow::default();
     for (argument, flow) in arguments.iter().zip(argument_flows) {
         let Ok(ty) = argument.ty(body.locals()) else {
@@ -1784,7 +2358,7 @@ fn apply_external_memory_effects(
     stored
         .unresolved_reasons
         .insert(UnresolvedReason::ExternalCode);
-    for argument in arguments {
+    for (index, argument) in arguments.iter().enumerate() {
         let Ok(ty) = argument.ty(body.locals()) else {
             continue;
         };
@@ -1795,6 +2369,22 @@ fn apply_external_memory_effects(
             continue;
         };
         merge_dyn_place(state, place, &stored);
+        propagate_region_effect(argument_flows.get(index), &stored, caller_effects);
+    }
+}
+
+fn propagate_region_effect(
+    region: Option<&DynFlow>,
+    effect: &DynFlow,
+    caller_effects: &mut [DynFlow],
+) {
+    let Some(region) = region else {
+        return;
+    };
+    for parameter in &region.parameters {
+        if let Some(destination) = caller_effects.get_mut(*parameter) {
+            destination.merge(effect);
+        }
     }
 }
 
@@ -1841,28 +2431,65 @@ fn transfer_dyn_statement(
     body: &Body,
     state: &mut DynState,
     statement: &rustc_public::mir::Statement,
+    parameter_effects: &mut [DynFlow],
+    generated_coroutine_flows: &mut HashMap<Instance, DynFlow>,
 ) {
     let StatementKind::Assign(destination, value) = &statement.kind else {
         return;
     };
+    if destination.projection.is_empty() {
+        let constant = constant_index_for_rvalue(body, state, value);
+        match constant {
+            Some(constant) => {
+                state.constant_indices.insert(destination.local, constant);
+            }
+            None => {
+                state.constant_indices.remove(&destination.local);
+            }
+        }
+    }
     match value {
         Rvalue::Ref(_, _, source) | Rvalue::AddressOf(_, source) | Rvalue::CopyForDeref(source) => {
             let targets = resolve_alias_places(state, source);
             state.aliases.insert(destination.clone(), targets);
+            if place_alias_is_uncertain(state, source) {
+                state.uncertain_aliases.insert(destination.clone());
+            } else {
+                state.uncertain_aliases.remove(destination);
+            }
         }
         Rvalue::Use(Operand::Copy(source) | Operand::Move(source), _)
         | Rvalue::Cast(_, Operand::Copy(source) | Operand::Move(source), _) => {
             if let Some(targets) = state.aliases.get(source).cloned() {
                 state.aliases.insert(destination.clone(), targets);
+                if place_alias_is_uncertain(state, source) {
+                    state.uncertain_aliases.insert(destination.clone());
+                } else {
+                    state.uncertain_aliases.remove(destination);
+                }
             } else {
                 state.aliases.remove(destination);
+                state.uncertain_aliases.remove(destination);
             }
         }
         _ => {
             state.aliases.remove(destination);
+            state.uncertain_aliases.remove(destination);
         }
     }
     let flow = dyn_flow_for_rvalue(body, state, value);
+    if let Rvalue::Aggregate(AggregateKind::Coroutine(definition, arguments), _) = value
+        && let Ok(coroutine) = Instance::resolve(FnDef(definition.def_id()), arguments)
+    {
+        generated_coroutine_flows
+            .entry(coroutine)
+            .or_default()
+            .merge(&flow);
+    }
+    if !destination.projection.is_empty() {
+        let region = read_dyn_place(state, &Place::from(destination.local));
+        propagate_region_effect(Some(&region), &flow, parameter_effects);
+    }
     write_dyn_place(state, destination, flow);
 
     let Rvalue::Aggregate(kind, operands) = value else {
@@ -1890,8 +2517,34 @@ fn transfer_dyn_statement(
             continue;
         };
         let mut field = destination.clone();
+        if let AggregateKind::Adt(definition, variant, ..) = kind
+            && definition.kind().is_enum()
+        {
+            field.projection.push(ProjectionElem::Downcast(*variant));
+        }
         field.projection.push(projection);
         write_dyn_place(state, &field, dyn_flow_for_operand(body, state, operand));
+    }
+}
+
+fn constant_index_for_rvalue(body: &Body, state: &DynState, value: &Rvalue) -> Option<u64> {
+    let operand = match value {
+        Rvalue::Use(operand, _) | Rvalue::Cast(_, operand, _) => operand,
+        _ => return None,
+    };
+    match operand {
+        Operand::Constant(constant)
+            if operand.ty(body.locals()).is_ok_and(|ty| {
+                matches!(ty.kind(), TyKind::RigidTy(RigidTy::Uint(UintTy::Usize)))
+            }) =>
+        {
+            constant.const_.eval_target_usize().ok()
+        }
+        Operand::Constant(_) => None,
+        Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+            state.constant_indices.get(&place.local).copied()
+        }
+        Operand::Copy(_) | Operand::Move(_) | Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -1936,7 +2589,10 @@ fn dyn_flow_for_rvalue(body: &Body, state: &DynState, value: &Rvalue) -> DynFlow
         Rvalue::UnaryOp(_, operand) => dyn_flow_for_operand(body, state, operand),
         Rvalue::ThreadLocalRef(_) | Rvalue::Discriminant(_) | Rvalue::Len(_) => DynFlow::default(),
     };
-    if flow.is_empty() && value.ty(body.locals()).is_ok_and(type_contains_dyn) {
+    if flow.is_empty()
+        && !rvalue_provenance_is_known(body, state, value)
+        && value.ty(body.locals()).is_ok_and(type_contains_dyn)
+    {
         flow.unresolved_reasons
             .insert(UnresolvedReason::AnalysisLimit);
     }
@@ -1948,11 +2604,50 @@ fn dyn_flow_for_operand(body: &Body, state: &DynState, operand: &Operand) -> Dyn
         Operand::Copy(place) | Operand::Move(place) => read_dyn_place(state, place),
         Operand::Constant(_) | Operand::RuntimeChecks(_) => DynFlow::default(),
     };
-    if flow.is_empty() && operand.ty(body.locals()).is_ok_and(type_contains_dyn) {
+    let known = operand_provenance_is_known(body, state, operand);
+    if flow.is_empty() && !known && operand.ty(body.locals()).is_ok_and(type_contains_dyn) {
         flow.unresolved_reasons
             .insert(UnresolvedReason::ExternalMemory);
     }
     flow
+}
+
+fn operand_provenance_is_known(body: &Body, state: &DynState, operand: &Operand) -> bool {
+    if operand
+        .ty(body.locals())
+        .is_ok_and(|ty| !type_contains_dyn(ty))
+    {
+        return true;
+    }
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => dyn_place_is_known(state, place),
+        Operand::Constant(constant) => match constant.const_.kind() {
+            ConstantKind::ZeroSized => true,
+            ConstantKind::Allocated(allocation) => allocation.provenance.ptrs.is_empty(),
+            ConstantKind::Ty(_) | ConstantKind::Unevaluated(_) | ConstantKind::Param(_) => false,
+        },
+        Operand::RuntimeChecks(_) => true,
+    }
+}
+
+fn rvalue_provenance_is_known(body: &Body, state: &DynState, value: &Rvalue) -> bool {
+    match value {
+        Rvalue::Use(operand, _)
+        | Rvalue::Repeat(operand, _)
+        | Rvalue::Cast(_, operand, _)
+        | Rvalue::UnaryOp(_, operand) => operand_provenance_is_known(body, state, operand),
+        Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) | Rvalue::CopyForDeref(place) => {
+            dyn_place_is_known(state, place)
+        }
+        Rvalue::Aggregate(_, operands) => operands
+            .iter()
+            .all(|operand| operand_provenance_is_known(body, state, operand)),
+        Rvalue::BinaryOp(_, left, right) | Rvalue::CheckedBinaryOp(_, left, right) => {
+            operand_provenance_is_known(body, state, left)
+                && operand_provenance_is_known(body, state, right)
+        }
+        Rvalue::ThreadLocalRef(_) | Rvalue::Discriminant(_) | Rvalue::Len(_) => true,
+    }
 }
 
 fn unknown_if_dyn_place(body: &Body, place: &Place, reason: UnresolvedReason) -> DynFlow {
@@ -1964,10 +2659,38 @@ fn unknown_if_dyn_place(body: &Body, place: &Place, reason: UnresolvedReason) ->
 }
 
 fn type_contains_dyn(ty: Ty) -> bool {
+    // Asking rustc_public for `TyKind` still panics on some valid coroutine
+    // closure and alias shapes. Its bounded display is safe for this shallow
+    // containment predicate; deep constructor traversal is guarded below.
     ty.to_string().contains("dyn ")
 }
 
-fn collect_adt_constructor_names(ty: Ty, names: &mut HashSet<String>) {
+fn type_may_hide_dyn_provenance(ty: Ty) -> bool {
+    let rendered = ty.to_string();
+    [
+        "{closure@",
+        "{async closure@",
+        "{async closure body@",
+        "{async block@",
+        "{coroutine@",
+        "{generator@",
+    ]
+    .iter()
+    .any(|marker| rendered.contains(marker))
+}
+
+fn collect_adt_constructor_names(ty: Ty, names: &mut HashSet<String>, visited: &mut HashSet<Ty>) {
+    if !visited.insert(ty) {
+        return;
+    }
+    // rustc_public cannot currently lower `CoroutineClosure` to its public
+    // `TyKind`. The unsupported value may also sit inside a tuple or ADT, in
+    // which case opening the outer kind recursively triggers the same panic.
+    // Constructor names are only a source-call suppression aid, so skipping
+    // this compiler-generated environment is both safe and sufficient.
+    if ty.to_string().contains("{async closure@") {
+        return;
+    }
     match ty.kind() {
         TyKind::RigidTy(RigidTy::Adt(definition, arguments)) => {
             names.extend(
@@ -1978,32 +2701,30 @@ fn collect_adt_constructor_names(ty: Ty, names: &mut HashSet<String>) {
             );
             for argument in arguments.0 {
                 if let Some(ty) = argument.ty() {
-                    collect_adt_constructor_names(*ty, names);
+                    collect_adt_constructor_names(*ty, names, visited);
                 }
             }
         }
+        // Function and coroutine generic arguments encode their environment
+        // and can duplicate captured type trees exponentially. Constructors
+        // used in their bodies are present in those bodies' own MIR locals;
+        // walking the environment here adds no source-call information.
         TyKind::RigidTy(
-            RigidTy::FnDef(_, arguments)
-            | RigidTy::Closure(_, arguments)
-            | RigidTy::Coroutine(_, arguments)
-            | RigidTy::CoroutineClosure(_, arguments)
-            | RigidTy::CoroutineWitness(_, arguments),
-        ) => {
-            for argument in arguments.0 {
-                if let Some(ty) = argument.ty() {
-                    collect_adt_constructor_names(*ty, names);
-                }
-            }
-        }
+            RigidTy::FnDef(..)
+            | RigidTy::Closure(..)
+            | RigidTy::Coroutine(..)
+            | RigidTy::CoroutineClosure(..)
+            | RigidTy::CoroutineWitness(..),
+        ) => {}
         TyKind::RigidTy(
             RigidTy::Array(ty, _)
             | RigidTy::Slice(ty)
             | RigidTy::RawPtr(ty, _)
             | RigidTy::Ref(_, ty, _),
-        ) => collect_adt_constructor_names(ty, names),
+        ) => collect_adt_constructor_names(ty, names, visited),
         TyKind::RigidTy(RigidTy::Tuple(types)) => {
             for ty in types {
-                collect_adt_constructor_names(ty, names);
+                collect_adt_constructor_names(ty, names, visited);
             }
         }
         _ => {}
@@ -2033,27 +2754,25 @@ fn read_dyn_place_without_alias(state: &DynState, place: &Place) -> DynFlow {
     if let Some(flow) = state.flows.get(place) {
         return flow.clone();
     }
+    let mut indexed = DynFlow::default();
+    let mut indexed_match = false;
+    for (candidate, flow) in &state.flows {
+        if constant_index_place_matches(state, place, candidate) {
+            indexed_match = true;
+            indexed.merge(flow);
+        }
+    }
+    if indexed_match {
+        return indexed;
+    }
     let mut ancestor = place.clone();
     while ancestor.projection.pop().is_some() {
         if let Some(flow) = state.flows.get(&ancestor) {
-            let suffix = &place.projection[ancestor.projection.len()..];
-            return if suffix
-                .iter()
-                .all(|projection| matches!(projection, ProjectionElem::Deref))
-            {
-                flow.clone()
-            } else {
-                // Locally built aggregates have explicit field entries above.
-                // A whole-value-only region came from opaque memory (for
-                // example an allocator-backed container), so retain its
-                // candidates but mark the projection as partial rather than
-                // assigning them as exact field provenance.
-                let mut projected = flow.clone();
-                projected
-                    .unresolved_reasons
-                    .insert(UnresolvedReason::ExternalMemory);
-                projected
-            };
+            // Any opacity of a whole-value region is already carried in the
+            // flow itself. Adding a fresh reason merely because a known local
+            // aggregate is projected turns exact container provenance into a
+            // false `[partial]` result.
+            return flow.clone();
         }
     }
     let mut result = DynFlow::default();
@@ -2066,20 +2785,134 @@ fn read_dyn_place_without_alias(state: &DynState, place: &Place) -> DynFlow {
 }
 
 fn write_dyn_place(state: &mut DynState, place: &Place, flow: DynFlow) {
-    let targets = resolve_alias_places(state, place);
-    let targets = if targets.len() == 1 && targets[0] == *place {
-        vec![place.clone()]
-    } else {
-        targets
-    };
+    let mut targets = Vec::new();
+    for target in resolve_alias_places(state, place) {
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    let initializes_alias = place.projection.is_empty() && state.aliases.contains_key(place);
+    if !initializes_alias && place_alias_is_uncertain(state, place) {
+        invalidate_dyn_places(state, &targets, UnresolvedReason::ExternalCode);
+        return;
+    }
+    let may_alias = targets.len() > 1;
     for target in targets {
+        let target = concretize_constant_index_place(state, &target).unwrap_or(target);
+        if weak_write_through_runtime_index(state, &target, &flow) {
+            continue;
+        }
+        if may_alias {
+            state.known.insert(target.clone());
+            if !flow.is_empty() {
+                state.flows.entry(target).or_default().merge(&flow);
+            }
+            continue;
+        }
         state
             .flows
             .retain(|candidate, _| !place_is_prefix(&target, candidate));
+        state
+            .known
+            .retain(|candidate| !place_is_prefix(&target, candidate));
+        state.known.insert(target.clone());
         if !flow.is_empty() {
             state.flows.insert(target, flow.clone());
         }
     }
+}
+
+fn concretize_constant_index_place(state: &DynState, target: &Place) -> Option<Place> {
+    let mut candidates = Vec::new();
+    for candidate in state.flows.keys().chain(&state.known) {
+        if constant_index_place_matches(state, target, candidate) && !candidates.contains(candidate)
+        {
+            candidates.push(candidate.clone());
+        }
+    }
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn constant_index_place_matches(state: &DynState, query: &Place, candidate: &Place) -> bool {
+    if query.local != candidate.local || query.projection.len() != candidate.projection.len() {
+        return false;
+    }
+    let mut used_constant_index = false;
+    let matches =
+        query
+            .projection
+            .iter()
+            .zip(&candidate.projection)
+            .all(|(query, candidate)| match (query, candidate) {
+                (
+                    ProjectionElem::Index(local),
+                    ProjectionElem::ConstantIndex {
+                        offset,
+                        from_end: false,
+                        ..
+                    },
+                ) => {
+                    used_constant_index = true;
+                    state.constant_indices.get(local) == Some(offset)
+                }
+                _ => query == candidate,
+            });
+    used_constant_index && matches
+}
+
+fn weak_write_through_runtime_index(state: &mut DynState, target: &Place, flow: &DynFlow) -> bool {
+    let Some(index) = target
+        .projection
+        .iter()
+        .position(|projection| matches!(projection, ProjectionElem::Index(_)))
+    else {
+        return false;
+    };
+    let mut aggregate = target.clone();
+    aggregate.projection.truncate(index);
+    state.known.insert(aggregate.clone());
+    if !flow.is_empty() {
+        state
+            .flows
+            .entry(aggregate.clone())
+            .or_default()
+            .merge(flow);
+    }
+
+    let overlapping = state
+        .flows
+        .keys()
+        .filter(|candidate| runtime_index_write_overlaps(target, candidate, index))
+        .cloned()
+        .collect::<Vec<_>>();
+    for candidate in overlapping {
+        state.known.insert(candidate.clone());
+        if !flow.is_empty() {
+            state.flows.entry(candidate).or_default().merge(flow);
+        }
+    }
+    true
+}
+
+fn runtime_index_write_overlaps(target: &Place, candidate: &Place, index: usize) -> bool {
+    if target.local != candidate.local || target.projection.len() != candidate.projection.len() {
+        return false;
+    }
+    target
+        .projection
+        .iter()
+        .zip(&candidate.projection)
+        .enumerate()
+        .all(|(projection_index, (target, candidate))| {
+            if projection_index == index {
+                matches!(
+                    candidate,
+                    ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. }
+                )
+            } else {
+                target == candidate
+            }
+        })
 }
 
 fn merge_dyn_place(state: &mut DynState, place: &Place, flow: &DynFlow) {
@@ -2087,9 +2920,58 @@ fn merge_dyn_place(state: &mut DynState, place: &Place, flow: &DynFlow) {
         return;
     }
     let targets = resolve_alias_places(state, place);
+    if place_alias_is_uncertain(state, place) {
+        invalidate_dyn_places(state, &targets, UnresolvedReason::ExternalCode);
+        return;
+    }
     for target in targets {
+        state.known.insert(target.clone());
         state.flows.entry(target).or_default().merge(flow);
     }
+}
+
+fn invalidate_dyn_places(state: &mut DynState, places: &[Place], reason: UnresolvedReason) {
+    for place in places {
+        state
+            .flows
+            .retain(|candidate, _| !place_is_prefix(place, candidate));
+        state
+            .known
+            .retain(|candidate| !place_is_prefix(place, candidate));
+        state.known.insert(place.clone());
+        state
+            .flows
+            .insert(place.clone(), DynFlow::unresolved(reason.clone()));
+    }
+}
+
+fn dyn_place_is_known(state: &DynState, place: &Place) -> bool {
+    let targets = resolve_alias_places(state, place);
+    !targets.is_empty()
+        && targets
+            .iter()
+            .all(|target| dyn_place_is_known_without_alias(state, target))
+}
+
+fn dyn_place_is_known_without_alias(state: &DynState, place: &Place) -> bool {
+    if state.known.contains(place) || state.flows.contains_key(place) {
+        return true;
+    }
+    if state
+        .known
+        .iter()
+        .chain(state.flows.keys())
+        .any(|candidate| constant_index_place_matches(state, place, candidate))
+    {
+        return true;
+    }
+    let mut ancestor = place.clone();
+    while ancestor.projection.pop().is_some() {
+        if state.known.contains(&ancestor) || state.flows.contains_key(&ancestor) {
+            return true;
+        }
+    }
+    false
 }
 
 fn resolve_alias_places(state: &DynState, place: &Place) -> Vec<Place> {
@@ -2117,6 +2999,14 @@ fn resolve_alias_places(state: &DynState, place: &Place) -> Vec<Place> {
         .collect()
 }
 
+fn place_alias_is_uncertain(state: &DynState, place: &Place) -> bool {
+    if state.uncertain_aliases.contains(place) {
+        return true;
+    }
+    let base = Place::from(place.local);
+    state.uncertain_aliases.contains(&base)
+}
+
 fn place_is_prefix(prefix: &Place, place: &Place) -> bool {
     prefix.local == place.local
         && prefix.projection.len() <= place.projection.len()
@@ -2129,6 +3019,11 @@ fn merge_dyn_state(destination: &mut Option<DynState>, source: &DynState) -> boo
         return true;
     };
     let mut changed = false;
+    let constants_before = destination.constant_indices.len();
+    destination
+        .constant_indices
+        .retain(|local, value| source.constant_indices.get(local) == Some(value));
+    changed |= destination.constant_indices.len() != constants_before;
     for (place, flow) in &source.flows {
         changed |= destination
             .flows
@@ -2144,6 +3039,12 @@ fn merge_dyn_state(destination: &mut Option<DynState>, source: &DynState) -> boo
                 changed = true;
             }
         }
+    }
+    for place in &source.uncertain_aliases {
+        changed |= destination.uncertain_aliases.insert(place.clone());
+    }
+    for place in &source.known {
+        changed |= destination.known.insert(place.clone());
     }
     changed
 }
@@ -2203,7 +3104,7 @@ fn specialize_semantic_functions(
                 }
                 RawSemanticCallTarget::Dynamic { dispatch, .. } => {
                     for trait_ref in observed_vtables {
-                        let Some(candidate) = resolve_dispatch_candidate(
+                        let Some(candidate) = resolve_observed_dispatch_candidate(
                             *dispatch,
                             trait_ref,
                             trait_method_implementations,
@@ -2369,13 +3270,14 @@ fn root_dyn_context(function: &RawSemanticFunction) -> Vec<ResolvedDynFlow> {
     function
         .parameter_types
         .iter()
-        .map(|parameter| ResolvedDynFlow {
+        .enumerate()
+        .map(|(index, parameter)| ResolvedDynFlow {
             concrete: Vec::new(),
-            unresolved_reasons: parameter
-                .contains("dyn ")
-                .then_some(UnresolvedReason::OpaqueInput)
-                .into_iter()
-                .collect(),
+            unresolved_reasons: (parameter.contains("dyn ")
+                || raw_function_uses_dyn_parameter(function, index))
+            .then_some(UnresolvedReason::OpaqueInput)
+            .into_iter()
+            .collect(),
         })
         .collect()
 }
@@ -2390,7 +3292,7 @@ fn call_dyn_context(
         .iter()
         .enumerate()
         .map(|(index, parameter)| {
-            if !parameter.contains("dyn ") {
+            if !parameter.contains("dyn ") && !raw_function_uses_dyn_parameter(callee, index) {
                 return ResolvedDynFlow::default();
             }
             arguments.get(index).map_or_else(
@@ -2410,6 +3312,19 @@ fn call_dyn_context(
             )
         })
         .collect()
+}
+
+fn raw_function_uses_dyn_parameter(function: &RawSemanticFunction, parameter: usize) -> bool {
+    function.calls.iter().any(|call| {
+        call.argument_flows
+            .iter()
+            .any(|flow| flow.parameters.contains(&parameter))
+            || matches!(
+                &call.target,
+                RawSemanticCallTarget::Dynamic { receiver, .. }
+                    if receiver.parameters.contains(&parameter)
+            )
+    })
 }
 
 fn resolve_context_flow(flow: &DynFlow, context: &[ResolvedDynFlow]) -> ResolvedDynFlow {
@@ -2655,13 +3570,14 @@ fn root_named_context(function: &SemanticFunction) -> Vec<NamedDynFlow> {
     function
         .parameter_types
         .iter()
-        .map(|parameter| NamedDynFlow {
+        .enumerate()
+        .map(|(index, parameter)| NamedDynFlow {
             concrete_types: BTreeSet::new(),
-            unresolved_reasons: parameter
-                .contains("dyn ")
-                .then_some(UnresolvedReason::OpaqueInput)
-                .into_iter()
-                .collect(),
+            unresolved_reasons: (parameter.contains("dyn ")
+                || semantic_function_uses_dyn_parameter(function, index))
+            .then_some(UnresolvedReason::OpaqueInput)
+            .into_iter()
+            .collect(),
         })
         .collect()
 }
@@ -2676,7 +3592,7 @@ fn named_call_context(
         .iter()
         .enumerate()
         .map(|(index, parameter)| {
-            if !parameter.contains("dyn ") {
+            if !parameter.contains("dyn ") && !semantic_function_uses_dyn_parameter(callee, index) {
                 return NamedDynFlow::default();
             }
             arguments.get(index).map_or_else(
@@ -2688,6 +3604,19 @@ fn named_call_context(
             )
         })
         .collect()
+}
+
+fn semantic_function_uses_dyn_parameter(function: &SemanticFunction, parameter: usize) -> bool {
+    function.calls.iter().any(|call| {
+        call.argument_flows
+            .iter()
+            .any(|flow| flow.parameters.contains(&parameter))
+            || matches!(
+                &call.target,
+                SemanticCallTarget::Dynamic { receiver_flow, .. }
+                    if receiver_flow.parameters.contains(&parameter)
+            )
+    })
 }
 
 fn resolve_named_flow(flow: &SemanticDynFlow, context: &[NamedDynFlow]) -> NamedDynFlow {
@@ -2801,6 +3730,56 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
             .or_default()
             .push(fact);
     }
+    let source_backed_semantic_keys = semantic
+        .functions
+        .iter()
+        .filter(|function| {
+            let file = source_file_identity(&file_identities, &function.body_span.file);
+            let Some(candidate_indices) = syntax_functions_by_file.get(file) else {
+                return false;
+            };
+            best_function_template(&syntax.functions, candidate_indices, &function.body_span)
+                .is_some_and(|template| {
+                    semantic_body_matches_source_template(function, template, &facts_by_subject)
+                })
+        })
+        .map(|function| function.key.clone())
+        .collect::<HashSet<_>>();
+    let mut transparent_dispatch_forwarders = semantic
+        .functions
+        .iter()
+        .filter(|function| !source_backed_semantic_keys.contains(&function.key))
+        .filter_map(|function| {
+            let [call] = function.calls.as_slice() else {
+                return None;
+            };
+            matches!(call.target, SemanticCallTarget::Dynamic { .. })
+                .then(|| (function.key.clone(), call.target.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for function in &semantic.functions {
+            if source_backed_semantic_keys.contains(&function.key)
+                || transparent_dispatch_forwarders.contains_key(&function.key)
+            {
+                continue;
+            }
+            let [call] = function.calls.as_slice() else {
+                continue;
+            };
+            let SemanticCallTarget::Direct { key, .. } = &call.target else {
+                continue;
+            };
+            if let Some(target) = transparent_dispatch_forwarders.get(key).cloned() {
+                transparent_dispatch_forwarders.insert(function.key.clone(), target);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 
     for semantic_function in semantic.functions {
         let function_file =
@@ -2817,6 +3796,9 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
             // are intentionally omitted until they have explicit source syntax.
             continue;
         };
+        if !semantic_body_matches_source_template(&semantic_function, template, &facts_by_subject) {
+            continue;
+        }
         matched_syntax_functions.insert(template.id.clone());
         let id = semantic_symbol(semantic_function.key);
         let mut claimed_calls = HashSet::new();
@@ -2830,6 +3812,9 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
                     &claimed_calls,
                     &file_identities,
                 ) else {
+                    if call.syntax.requires_compiler_confirmation() {
+                        return None;
+                    }
                     let is_constructor = semantic_function
                         .constructor_spans
                         .iter()
@@ -2866,11 +3851,41 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
                 let mut resolved = call.clone();
                 claimed_calls.insert(match_index);
                 let semantic_call = &semantic_function.calls[match_index];
-                match &semantic_call.target {
+                let semantic_target = match &semantic_call.target {
+                    SemanticCallTarget::Direct { key, .. } => transparent_dispatch_forwarders
+                        .get(key)
+                        .unwrap_or(&semantic_call.target),
+                    _ => &semantic_call.target,
+                };
+                match semantic_target {
                     SemanticCallTarget::Direct { key, display } => {
-                        resolved.target = CallTarget::Direct(semantic_symbol(key.clone()));
-                        if local_function_keys.contains(key) {
-                            resolved.label = replace_label_callee(&resolved.label, display);
+                        if matches!(
+                            call.syntax.visible(),
+                            CallSyntax::Expression(expression)
+                                if direct_lambda_callee(expression).is_some()
+                        ) && let Some(closure) =
+                            source_closure_for_call(template, call, &syntax.functions)
+                        {
+                            resolved.target = semantic_closure_keys
+                                .get(&closure.id)
+                                .cloned()
+                                .map(semantic_symbol)
+                                .map_or_else(
+                                    || {
+                                        required_syntax_closures.insert(closure.id.clone());
+                                        CallTarget::Direct(closure.id.clone())
+                                    },
+                                    CallTarget::Direct,
+                                );
+                            resolved.label = replace_label_callee(
+                                &resolved.label,
+                                closure_label_callee(closure),
+                            );
+                        } else {
+                            resolved.target = CallTarget::Direct(semantic_symbol(key.clone()));
+                            if local_function_keys.contains(key) {
+                                resolved.label = replace_label_callee(&resolved.label, display);
+                            }
                         }
                     }
                     SemanticCallTarget::Dynamic {
@@ -2887,7 +3902,7 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
                                 .iter()
                                 .map(|candidate| DispatchCandidate {
                                     target: semantic_symbol(candidate.key.clone()),
-                                    label: replace_label_callee(
+                                    label: replace_dispatch_candidate_label(
                                         &resolved.label,
                                         &candidate.display,
                                     ),
@@ -2919,6 +3934,25 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
                     }
                     SemanticCallTarget::Unresolved => {
                         resolved.target = CallTarget::Unresolved;
+                        if let Some(closure) =
+                            source_closure_for_call(template, call, &syntax.functions)
+                        {
+                            resolved.target = semantic_closure_keys
+                                .get(&closure.id)
+                                .cloned()
+                                .map(semantic_symbol)
+                                .map_or_else(
+                                    || {
+                                        required_syntax_closures.insert(closure.id.clone());
+                                        CallTarget::Direct(closure.id.clone())
+                                    },
+                                    CallTarget::Direct,
+                                );
+                            resolved.label = replace_label_callee(
+                                &resolved.label,
+                                closure_label_callee(closure),
+                            );
+                        }
                     }
                 }
                 let argument_types = semantic_call_argument_types(semantic_call);
@@ -2958,7 +3992,22 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
         if !preserve_closure && !preserve_open_generic {
             continue;
         }
-        analysis.functions.push(function.clone());
+        let mut preserved = function.clone();
+        if preserve_closure {
+            for call in &mut preserved.calls {
+                if !matches!(call.target, CallTarget::Unresolved) {
+                    continue;
+                }
+                let Some(nested) = source_closure_for_call(function, call, &syntax.functions)
+                else {
+                    continue;
+                };
+                required_syntax_closures.insert(nested.id.clone());
+                call.target = CallTarget::Direct(nested.id.clone());
+                call.label = replace_label_callee(&call.label, closure_label_callee(nested));
+            }
+        }
+        analysis.functions.push(preserved);
         if preserve_open_generic && let Some(facts) = facts_by_subject.get(&function.id) {
             analysis.facts.extend(facts.iter().copied().cloned());
         }
@@ -2967,6 +4016,28 @@ fn merge_semantic_program(syntax: FileAnalysis, mut semantic: SemanticProgram) -
     synthesize_referenced_generic_instances(&mut analysis, &syntax);
 
     analysis
+}
+
+fn semantic_body_matches_source_template(
+    semantic: &SemanticFunction,
+    template: &FunctionInfo,
+    facts_by_subject: &HashMap<&SymbolId, Vec<&LanguageFact>>,
+) -> bool {
+    if compiler_closure_marker(&semantic.definition_name).is_none() {
+        return true;
+    }
+    if is_source_closure(template) {
+        return true;
+    }
+    // An async fn is represented by a compiler coroutine body whose source
+    // span belongs to the function itself. Other compiler closures must have
+    // an explicit source closure template; otherwise macro-generated bodies
+    // would be misattributed to the enclosing function as duplicate roots.
+    facts_by_subject.get(&template.id).is_some_and(|facts| {
+        facts
+            .iter()
+            .any(|fact| fact.kind == "modifier" && fact.key == "async")
+    })
 }
 
 fn synthesize_referenced_generic_instances(analysis: &mut FileAnalysis, syntax: &FileAnalysis) {
@@ -3156,14 +4227,43 @@ fn source_closure_for_call<'a>(
     call: &CallSite,
     functions: &'a [FunctionInfo],
 ) -> Option<&'a FunctionInfo> {
-    let name = call_syntax_name(call)?;
     let expected_container = owner.id.qualified_parts().join("::");
-    let expected_lambda = format!("λ{name}");
+    let expected_lambda = match call.syntax.visible() {
+        CallSyntax::Expression(expression) => direct_lambda_callee(expression),
+        _ => call_syntax_name(call).map(|name| format!("λ{name}")),
+    }?;
     functions.iter().find(|function| {
         is_source_closure(function)
             && function.id.container.as_deref() == Some(expected_container.as_str())
             && closure_label_callee(function) == expected_lambda
     })
+}
+
+fn direct_lambda_callee(expression: &str) -> Option<String> {
+    let mut expression = expression.trim();
+    while let Some(inner) = expression.strip_prefix('(') {
+        let mut depth = 1usize;
+        let mut closing = None;
+        for (index, character) in inner.char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        closing = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let closing = closing?;
+        if closing + ')'.len_utf8() != inner.len() {
+            break;
+        }
+        expression = inner[..closing].trim();
+    }
+    expression.starts_with('λ').then(|| expression.to_owned())
 }
 
 fn closure_label_callee(function: &FunctionInfo) -> &str {
@@ -3373,8 +4473,27 @@ fn canonicalize_closure_value(
     }
     match rewrite {
         ClosureRewrite::Identity => value,
-        ClosureRewrite::Display => render_compiler_closure_markers(&value),
+        ClosureRewrite::Display => {
+            render_compiler_closure_markers(&strip_closure_environment_contexts(&value))
+        }
     }
+}
+
+fn strip_closure_environment_contexts(value: &str) -> String {
+    const PREFIX: &str = "[[diffkit-closure-env:";
+    let mut output = String::with_capacity(value.len());
+    let mut remainder = value;
+    while let Some(start) = remainder.find(PREFIX) {
+        output.push_str(&remainder[..start]);
+        let context = &remainder[start + PREFIX.len()..];
+        let Some(end) = context.find("]]") else {
+            output.push_str(&remainder[start..]);
+            return output;
+        };
+        remainder = &context[end + 2..];
+    }
+    output.push_str(remainder);
+    output
 }
 
 fn render_compiler_closure_markers(value: &str) -> String {
@@ -3575,7 +4694,7 @@ fn best_semantic_call(
     claimed: &HashSet<usize>,
     file_identities: &HashMap<PathBuf, PathBuf>,
 ) -> Option<usize> {
-    let syntax_name = call_syntax_name(syntax_call)?;
+    let syntax_name = call_syntax_name(syntax_call);
 
     semantic_calls
         .iter()
@@ -3593,7 +4712,8 @@ fn best_semantic_call(
                 .rsplit("::")
                 .next()
                 .unwrap_or(&call.definition_name);
-            definition_leaf == syntax_name || span_coordinates_equal(&syntax_call.span, &call.span)
+            syntax_name.is_none_or(|syntax_name| definition_leaf == syntax_name)
+                || span_coordinates_equal(&syntax_call.span, &call.span)
         })
         .min_by_key(|(_, call)| {
             let definition_leaf = call
@@ -3601,16 +4721,19 @@ fn best_semantic_call(
                 .rsplit("::")
                 .next()
                 .unwrap_or(&call.definition_name);
-            let name_penalty = usize::from(definition_leaf != syntax_name) * 1_000_000;
+            let name_penalty = syntax_name
+                .map(|syntax_name| usize::from(definition_leaf != syntax_name) * 1_000_000)
+                .unwrap_or_default();
             name_penalty + span_distance(&syntax_call.span, &call.span)
         })
         .map(|(index, _)| index)
 }
 
 fn call_syntax_name(call: &CallSite) -> Option<&str> {
-    match &call.syntax {
+    match call.syntax.visible() {
         CallSyntax::Path(parts) => parts.last().map(String::as_str),
         CallSyntax::SelfMethod(method) | CallSyntax::Method { method, .. } => Some(method.as_str()),
+        CallSyntax::Expression(_) | CallSyntax::CompilerConfirmed(_) => None,
     }
 }
 
@@ -3632,14 +4755,96 @@ fn semantic_symbol(name: String) -> SymbolId {
 
 fn stable_instance_name(instance: Instance) -> String {
     let name = instance.name().to_string();
+    let arguments = instance.args();
     let mut replacements = BTreeMap::<String, Option<String>>::new();
-    collect_compiler_closure_replacements(&instance.args(), &mut replacements);
-    replacements
+    collect_compiler_closure_replacements(&arguments, &mut replacements);
+    let mut stable = replacements
         .into_iter()
         .filter_map(|(located, marker)| marker.map(|marker| (located, marker)))
         .fold(name, |name, (located, marker)| {
             name.replace(&located, &marker)
-        })
+        });
+    if let Some(environment) = closure_environment_context(&arguments) {
+        stable.push_str("[[diffkit-closure-env:");
+        stable.push_str(&environment);
+        stable.push_str("]]");
+    }
+    stable
+}
+
+/// rustc's display form intentionally prints a closure type using only its
+/// definition location. Distinct monomorphizations of the same closure can
+/// therefore have identical names even though their captured generic
+/// environments (and call trees) differ. Preserve a compact structural
+/// environment in semantic identities, while the display layer strips it.
+///
+/// Only direct ordinary closures are opened. Looking through arbitrary
+/// `TyKind`s is unsafe with the current rustc_public API because conversion of
+/// coroutine-closure and some alias types is still unimplemented. Direct
+/// closure arguments are the substitution chain that distinguishes the
+/// monomorphizations; aggregate captures are represented separately by their
+/// normalized rendered shape.
+fn closure_environment_context(arguments: &GenericArgs) -> Option<String> {
+    let mut context = String::new();
+    let mut active = HashSet::new();
+    let has_closure = append_closure_environment(arguments, &mut active, &mut context);
+    has_closure.then_some(context)
+}
+
+fn append_closure_environment(
+    arguments: &GenericArgs,
+    active: &mut HashSet<Ty>,
+    output: &mut String,
+) -> bool {
+    let mut has_closure = false;
+    output.push('(');
+    for (index, argument) in arguments.0.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        let GenericArgKind::Type(ty) = argument else {
+            output.push('_');
+            continue;
+        };
+        let rendered = ty.to_string();
+        if rendered.starts_with("{closure@")
+            && let TyKind::RigidTy(RigidTy::Closure(definition, nested)) = ty.kind()
+        {
+            has_closure = true;
+            let marker = compiler_closure_marker(&definition.name().to_string())
+                .unwrap_or_else(|| "{lambda-def:unknown:λclosure}".to_owned());
+            output.push_str(&marker);
+            if active.insert(*ty) {
+                append_closure_environment(&nested, active, output);
+                active.remove(ty);
+            }
+            continue;
+        }
+
+        let normalized = normalize_type_identity_shape(&rendered);
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        output.push_str("t:");
+        output.push_str(&digest[..12]);
+    }
+    output.push(')');
+    has_closure
+}
+
+fn normalize_type_identity_shape(value: &str) -> String {
+    [
+        ("{closure@", "{closure}"),
+        ("{async closure body@", "{async closure body}"),
+        ("{async closure@", "{async closure}"),
+        ("{async block@", "{async block}"),
+        ("{coroutine@", "{coroutine}"),
+        ("{generator@", "{generator}"),
+    ]
+    .into_iter()
+    .fold(value.to_owned(), |value, (prefix, replacement)| {
+        replace_braced_location(&value, prefix, replacement)
+    })
 }
 
 fn collect_compiler_closure_replacements(
@@ -3747,6 +4952,7 @@ fn normalize_instance_display(name: &str, crate_name: &str) -> String {
 
 fn normalize_anonymous_type_locations(value: &str) -> String {
     [
+        ("{async closure body@", "{async closure body}"),
         ("{async block@", "{async block}"),
         ("{coroutine@", "{coroutine}"),
         ("{generator@", "{generator}"),
@@ -3797,6 +5003,33 @@ fn replace_label_callee(label: &CallLabel, callee: &str) -> CallLabel {
     }
 }
 
+fn replace_dispatch_candidate_label(label: &CallLabel, callee: &str) -> CallLabel {
+    let rewrite = |text: &str| {
+        let candidate = dispatch_candidate_callee(callee);
+        outer_call_arguments_start(text).map_or(candidate.clone(), |arguments_start| {
+            format!("{candidate}{}", &text[arguments_start..])
+        })
+    };
+    CallLabel {
+        default: rewrite(&label.default),
+        typed: label.typed.as_deref().map(rewrite),
+    }
+}
+
+fn dispatch_candidate_callee(callee: &str) -> String {
+    let callee = collapse_trait_qualification(callee);
+    if callee.starts_with('λ') {
+        return callee;
+    }
+    let segments = split_top_level_path(&callee);
+    let start = segments.len().saturating_sub(2);
+    segments[start..]
+        .iter()
+        .map(|segment| simplify_type_paths(segment))
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
 fn replace_callee_text(label: &str, callee: &str) -> String {
     if let Some(arguments_start) = outer_call_arguments_start(label) {
         format!(
@@ -3812,6 +5045,13 @@ fn replace_callee_text(label: &str, callee: &str) -> String {
 fn semantic_callee(source: &str, semantic: &str) -> String {
     if semantic.starts_with('λ') {
         return semantic.to_owned();
+    }
+    if source.contains('<') && source.contains('λ') {
+        // rustc exposes the generated future returned by an async closure as
+        // an extra monomorphization argument. The source closure is the
+        // callable identity users wrote; keep that compact source generic and
+        // hide the compiler-only `{async closure body}` type.
+        return source.to_owned();
     }
     if semantic.starts_with("dyn ") {
         return semantic.rsplit_once("::").map_or_else(
@@ -3832,11 +5072,20 @@ fn semantic_callee(source: &str, semantic: &str) -> String {
     }
 
     let parts = semantic.split("::").collect::<Vec<_>>();
+    let source_receiver = source
+        .rsplit_once("::")
+        .map(|(receiver, _)| receiver.rsplit("::").next().unwrap_or(receiver));
+    let source_requests_concrete_receiver = source.contains('.')
+        || source.starts_with('<')
+        || source_receiver.is_some_and(|receiver| {
+            receiver == "Self" || receiver.chars().next().is_some_and(char::is_uppercase)
+        });
     if parts.len() >= 2
-        && parts[parts.len() - 2]
-            .chars()
-            .next()
-            .is_some_and(char::is_uppercase)
+        && (source_requests_concrete_receiver
+            || parts[parts.len() - 2]
+                .chars()
+                .next()
+                .is_some_and(char::is_uppercase))
     {
         return format!("{}::{}", parts[parts.len() - 2], parts[parts.len() - 1]);
     }
@@ -4310,6 +5559,7 @@ impl<'ast> Visit<'ast> for ClosureExtractor<'_> {
             file: self.file,
             closure_sources: self.closure_sources,
             calls: Vec::new(),
+            compiler_confirmation_required: false,
         };
         calls.visit_expr(&node.body);
         let parameters = node.inputs.iter().map(pattern_name).collect::<Vec<_>>();
@@ -4326,7 +5576,7 @@ impl<'ast> Visit<'ast> for ClosureExtractor<'_> {
             })
             .collect::<Vec<_>>();
         self.functions.push(FunctionInfo {
-            id,
+            id: id.clone(),
             label: CallLabel::with_types(
                 format!("{lambda}({})", parameters.join(", ")),
                 format!("{lambda}({})", typed_parameters.join(", ")),
@@ -4335,10 +5585,27 @@ impl<'ast> Visit<'ast> for ClosureExtractor<'_> {
             calls: calls.calls,
             span: source_span(self.file, node.span()),
         });
-        visit::visit_expr_closure(self, node);
+        let mut nested = ClosureExtractor {
+            file: self.file,
+            module: self.module,
+            owner: &id,
+            closure_sources: self.closure_sources,
+            functions: Vec::new(),
+        };
+        visit::visit_expr_closure(&mut nested, node);
+        self.functions.extend(nested.functions);
     }
 
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        let Some(expressions) = evaluated_macro_expressions(node) else {
+            return;
+        };
+        for expression in &expressions {
+            self.visit_expr(expression);
+        }
+    }
 }
 
 fn function_from_parts(
@@ -4361,6 +5628,7 @@ fn function_from_parts(
         file,
         closure_sources: &closure_sources,
         calls: Vec::new(),
+        compiler_confirmation_required: false,
     };
     collector.visit_block(block);
     rewrite_symbolic_generic_calls(module, signature, &mut collector.calls);
@@ -4611,7 +5879,7 @@ fn rewrite_symbolic_generic_calls(
         .collect::<HashMap<_, _>>();
 
     for call in calls {
-        let CallSyntax::Method { receiver, method } = &call.syntax else {
+        let CallSyntax::Method { receiver, method } = call.syntax.visible() else {
             continue;
         };
         let Some(generic) = receivers.get(receiver) else {
@@ -4717,7 +5985,70 @@ fn is_public(visibility: &Visibility) -> bool {
 }
 
 fn compact_tokens(tokens: &impl ToTokens) -> String {
-    tokens.to_token_stream().to_string().replace(' ', "")
+    render_compact_tokens(tokens.to_token_stream())
+}
+
+#[derive(Clone)]
+enum CompactToken {
+    Word(String),
+    Punct(char),
+    Group(Delimiter, String),
+}
+
+fn render_compact_tokens(stream: TokenStream) -> String {
+    let tokens = stream
+        .into_iter()
+        .map(|token| match token {
+            TokenTree::Ident(ident) => CompactToken::Word(ident.to_string()),
+            TokenTree::Literal(literal) => CompactToken::Word(literal.to_string()),
+            TokenTree::Punct(punct) => CompactToken::Punct(punct.as_char()),
+            TokenTree::Group(group) => {
+                CompactToken::Group(group.delimiter(), render_compact_tokens(group.stream()))
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut rendered = String::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if index > 0 && compact_tokens_need_space(&tokens[index - 1], token) {
+            rendered.push(' ');
+        }
+        match token {
+            CompactToken::Word(word) => rendered.push_str(word),
+            CompactToken::Punct(punct) => rendered.push(*punct),
+            CompactToken::Group(delimiter, body) => match delimiter {
+                Delimiter::Parenthesis => {
+                    rendered.push('(');
+                    rendered.push_str(body);
+                    rendered.push(')');
+                }
+                Delimiter::Brace => {
+                    rendered.push('{');
+                    rendered.push_str(body);
+                    rendered.push('}');
+                }
+                Delimiter::Bracket => {
+                    rendered.push('[');
+                    rendered.push_str(body);
+                    rendered.push(']');
+                }
+                Delimiter::None => rendered.push_str(body),
+            },
+        }
+    }
+    rendered
+}
+
+fn compact_tokens_need_space(previous: &CompactToken, current: &CompactToken) -> bool {
+    match (previous, current) {
+        (CompactToken::Word(_), CompactToken::Word(_))
+        | (CompactToken::Group(_, _), CompactToken::Word(_)) => true,
+        (CompactToken::Punct(',' | ';'), CompactToken::Word(_)) => true,
+        (CompactToken::Word(word), CompactToken::Punct('|')) => {
+            matches!(word.as_str(), "move" | "async")
+        }
+        (CompactToken::Word(_), CompactToken::Group(Delimiter::Brace, _)) => true,
+        _ => false,
+    }
 }
 
 fn source_span(file: &Path, span: Span) -> SourceSpan {
@@ -4738,6 +6069,7 @@ struct CallCollector<'a> {
     file: &'a Path,
     closure_sources: &'a HashMap<ClosureSpan, ClosureSource>,
     calls: Vec<CallSite>,
+    compiler_confirmation_required: bool,
 }
 
 impl<'ast> Visit<'ast> for CallCollector<'_> {
@@ -4746,23 +6078,27 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
         // the same order so an aggregate constructor such as `Some(f())`
         // cannot claim `f`'s semantic call span.
         visit::visit_expr_call(self, node);
-        if let Some(parts) = callable_path(&node.func) {
-            let syntax = CallSyntax::Path(parts);
-            let span = source_span(self.file, node.span());
-            self.calls.push(CallSite {
-                id: CallSiteId::source(&syntax, &span),
-                syntax,
-                target: CallTarget::Unresolved,
-                label: CallLabel::new(call_expression_label(node, self.closure_sources)),
-                span,
-            });
+        let mut syntax = callable_path(&node.func).map_or_else(
+            || CallSyntax::Expression(compact_expression(&node.func, self.closure_sources)),
+            CallSyntax::Path,
+        );
+        if self.compiler_confirmation_required {
+            syntax = CallSyntax::CompilerConfirmed(Box::new(syntax));
         }
+        let span = source_span(self.file, node.span());
+        self.calls.push(CallSite {
+            id: CallSiteId::source(&syntax, &span),
+            syntax,
+            target: CallTarget::Unresolved,
+            label: CallLabel::new(call_expression_label(node, self.closure_sources)),
+            span,
+        });
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         visit::visit_expr_method_call(self, node);
         let method = node.method.to_string();
-        let syntax = if is_self_expr(&node.receiver) {
+        let mut syntax = if is_self_expr(&node.receiver) {
             CallSyntax::SelfMethod(method)
         } else {
             CallSyntax::Method {
@@ -4770,6 +6106,9 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
                 method,
             }
         };
+        if self.compiler_confirmation_required {
+            syntax = CallSyntax::CompilerConfirmed(Box::new(syntax));
+        }
         let span = source_span(self.file, node.span());
         self.calls.push(CallSite {
             id: CallSiteId::source(&syntax, &span),
@@ -4784,7 +6123,48 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
     // to the enclosing function.
     fn visit_expr_closure(&mut self, _node: &'ast ExprClosure) {}
 
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        let Some(expressions) = evaluated_macro_expressions(node) else {
+            return;
+        };
+        let previous = self.compiler_confirmation_required;
+        self.compiler_confirmation_required = true;
+        for expression in &expressions {
+            self.visit_expr(expression);
+        }
+        self.compiler_confirmation_required = previous;
+    }
+
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
+fn evaluated_macro_expressions(node: &Macro) -> Option<Punctuated<Expr, Token![,]>> {
+    let name = node.path.segments.last()?.ident.to_string();
+    if !matches!(
+        name.as_str(),
+        "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "dbg"
+            | "eprint"
+            | "eprintln"
+            | "format"
+            | "format_args"
+            | "panic"
+            | "print"
+            | "println"
+            | "vec"
+            | "write"
+            | "writeln"
+    ) {
+        return None;
+    }
+    Punctuated::<Expr, Token![,]>::parse_terminated
+        .parse2(node.tokens.clone())
+        .ok()
 }
 
 fn call_expression_label(
@@ -4895,6 +6275,15 @@ impl<'ast> Visit<'ast> for ClosureOrdinalCollector {
             },
         );
         visit::visit_expr_closure(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        let Some(expressions) = evaluated_macro_expressions(node) else {
+            return;
+        };
+        for expression in &expressions {
+            self.visit_expr(expression);
+        }
     }
 
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}

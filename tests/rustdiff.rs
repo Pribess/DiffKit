@@ -1,5 +1,7 @@
 #![feature(rustc_private)]
 
+use diffkit::graph::ProgramGraph;
+use diffkit::model::{CallNode, CallRelation};
 use diffkit::{
     ColorMode, DiffOptions, DiffReport, RenderOptions, render_report_with_options, rustdiff_sources,
 };
@@ -12,6 +14,10 @@ fn render_plain(report: &DiffReport) -> String {
             color: ColorMode::Plain,
         },
     )
+}
+
+fn contains_back_edge(node: &CallNode) -> bool {
+    node.relation == CallRelation::BackEdge || node.children.iter().any(contains_back_edge)
 }
 
 #[test]
@@ -928,6 +934,8 @@ fn dyn_provenance_survives_a_standard_library_container() {
         !rendered.contains("dyn Store::save() [unresolved]"),
         "{rendered}"
     );
+    assert!(!rendered.contains("[partial]"), "{rendered}");
+    assert!(!rendered.contains("… unresolved targets"), "{rendered}");
     assert!(rendered.contains("commit()"), "{rendered}");
 }
 
@@ -1001,4 +1009,1012 @@ fn inserting_an_unrelated_closure_does_not_renumber_existing_closure_identity() 
             .iter()
             .all(|function| !function.id.name.contains("{closure#"))
     );
+}
+
+#[test]
+fn inserting_a_same_signature_closure_does_not_churn_existing_closures() {
+    let before = r#"
+        fn apply<F: Fn()>(callback: F) { callback(); }
+        fn first() {}
+        fn second() {}
+        pub fn run() {
+            apply(|| first());
+            apply(|| second());
+        }
+    "#;
+    let after = r#"
+        fn apply<F: Fn()>(callback: F) { callback(); }
+        fn inserted() {}
+        fn first() {}
+        fn second() {}
+        pub fn run() {
+            apply(|| inserted());
+            apply(|| first());
+            apply(|| second());
+        }
+    "#;
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    for stable in ["first()", "second()"] {
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("- ") && line.contains(stable)),
+            "{rendered}"
+        );
+    }
+    assert!(rendered.contains("inserted()"), "{rendered}");
+}
+
+#[test]
+fn deeply_nested_closure_types_finish_without_inventing_recursion() {
+    let source = r#"
+        fn duplicate(f: impl Fn(i32) -> i32) -> impl Fn(i32) -> i32 {
+            move |value| f(value * 2)
+        }
+
+        pub fn run() {
+            let callback = |value| value;
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let callback = duplicate(callback);
+            let _ = callback(1);
+        }
+    "#;
+
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 64).unwrap();
+
+    assert_eq!(graph.inferred_roots(), [run].into_iter().collect());
+    assert!(!contains_back_edge(&tree), "{tree:#?}");
+}
+
+#[test]
+fn dyn_provenance_crosses_a_mutating_helper_without_becoming_partial() {
+    let before = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        impl Store for Postgres { fn save(&self) { write(); } }
+        fn write() {}
+        fn install(slot: &mut Option<Box<dyn Store>>, value: Box<dyn Store>) {
+            *slot = Some(value);
+        }
+        pub fn run() {
+            let mut slot: Option<Box<dyn Store>> = None;
+            install(&mut slot, Box::new(Postgres));
+            slot.unwrap().save();
+        }
+    "#;
+    let after = before.replace("fn write() {}", "fn write() { commit(); } fn commit() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("install(&mut slot,"), "{rendered}");
+    assert!(rendered.contains("Postgres::save()"), "{rendered}");
+    assert!(rendered.contains("commit()"), "{rendered}");
+    assert!(!rendered.contains("[partial]"), "{rendered}");
+    assert!(!rendered.contains("[unresolved]"), "{rendered}");
+}
+
+#[test]
+fn a_returned_mutable_reference_updates_the_original_dyn_place() {
+    let source = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        struct S3;
+        impl Store for Postgres { fn save(&self) { postgres_leaf(); } }
+        impl Store for S3 { fn save(&self) { s3_leaf(); } }
+        fn postgres_leaf() {}
+        fn s3_leaf() {}
+        fn expose(value: &mut Box<dyn Store>) -> &mut Box<dyn Store> { value }
+        pub fn run() {
+            let mut store: Box<dyn Store> = Box::new(Postgres);
+            *expose(&mut store) = Box::new(S3);
+            store.save();
+        }
+        struct Pair {
+            left: Box<dyn Store>,
+            right: Box<dyn Store>,
+        }
+        fn expose_left(pair: &mut Pair) -> &mut Box<dyn Store> { &mut pair.left }
+        pub fn update_left() {
+            let mut pair = Pair {
+                left: Box::new(Postgres),
+                right: Box::new(Postgres),
+            };
+            *expose_left(&mut pair) = Box::new(S3);
+            pair.left.save();
+        }
+        pub fn preserve_right() {
+            let mut pair = Pair {
+                left: Box::new(Postgres),
+                right: Box::new(Postgres),
+            };
+            *expose_left(&mut pair) = Box::new(S3);
+            pair.right.save();
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+    let dispatch = tree
+        .children
+        .iter()
+        .find(|call| call.label.default == "dyn Store::save()")
+        .unwrap();
+
+    assert_eq!(
+        dispatch
+            .children
+            .iter()
+            .map(|candidate| candidate.label.default.as_str())
+            .collect::<Vec<_>>(),
+        ["S3::save()"]
+    );
+
+    for (entry, expected) in [
+        ("update_left", "S3::save()"),
+        ("preserve_right", "Postgres::save()"),
+    ] {
+        let root = graph.resolve_entry(entry).unwrap().unwrap();
+        let tree = graph.build_call_tree(&root, 8).unwrap();
+        let dispatch = tree
+            .children
+            .iter()
+            .find(|call| call.label.default == "dyn Store::save()")
+            .unwrap();
+        assert_eq!(dispatch.children[0].label.default, expected);
+    }
+}
+
+#[test]
+fn writes_through_an_opaque_external_guard_do_not_keep_a_stale_exact_candidate() {
+    let source = r#"
+        use std::cell::RefCell;
+        trait Store { fn save(&self); }
+        struct Postgres;
+        struct S3;
+        impl Store for Postgres { fn save(&self) {} }
+        impl Store for S3 { fn save(&self) {} }
+        pub fn run() {
+            let store: RefCell<Box<dyn Store>> = RefCell::new(Box::new(Postgres));
+            *store.borrow_mut() = Box::new(S3);
+            store.borrow().save();
+        }
+        pub fn read_only() {
+            let store: RefCell<Box<dyn Store>> = RefCell::new(Box::new(Postgres));
+            store.borrow().save();
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+    let dispatch = tree
+        .children
+        .iter()
+        .find(|call| call.label.default.starts_with("dyn Store::save()"))
+        .unwrap();
+
+    assert_eq!(dispatch.label.default, "dyn Store::save() [unresolved]");
+    assert!(dispatch.children.is_empty(), "{dispatch:#?}");
+
+    let read_only = graph.resolve_entry("read_only").unwrap().unwrap();
+    let read_only_tree = graph.build_call_tree(&read_only, 8).unwrap();
+    let read_dispatch = read_only_tree
+        .children
+        .iter()
+        .find(|call| call.label.default == "dyn Store::save()")
+        .unwrap();
+    assert_eq!(read_dispatch.children[0].label.default, "Postgres::save()");
+}
+
+#[test]
+fn exact_dyn_provenance_survives_option_reference_adapters() {
+    let before = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        impl Store for Postgres { fn save(&self) { write(); } }
+        fn write() {}
+        fn install(slot: &mut Option<Box<dyn Store>>) {
+            *slot = Some(Box::new(Postgres));
+        }
+        pub fn run() {
+            let mut slot: Option<Box<dyn Store>> = None;
+            install(&mut slot);
+            slot.as_ref().unwrap().save();
+        }
+    "#;
+    let after = before.replace("fn write() {}", "fn write() { commit(); } fn commit() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("Postgres::save()"), "{rendered}");
+    assert!(rendered.contains("commit()"), "{rendered}");
+    assert!(!rendered.contains("[partial]"), "{rendered}");
+}
+
+#[test]
+fn a_non_storing_helper_does_not_invent_a_dyn_candidate() {
+    let before = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        struct S3;
+        impl Store for Postgres { fn save(&self) { postgres(); } }
+        impl Store for S3 { fn save(&self) { s3(); } }
+        fn postgres() {}
+        fn s3() {}
+        fn inspect(_: &mut Option<Box<dyn Store>>, _: Box<dyn Store>) {}
+        pub fn run() {
+            let mut slot: Option<Box<dyn Store>> = Some(Box::new(Postgres));
+            inspect(&mut slot, Box::new(S3));
+            slot.unwrap().save();
+        }
+    "#;
+    let after = before.replace(
+        "fn postgres() {}",
+        "fn postgres() { commit(); } fn commit() {}",
+    );
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("Postgres::save()"), "{rendered}");
+    assert!(!rendered.contains("S3::save()"), "{rendered}");
+    assert!(!rendered.contains("[partial]"), "{rendered}");
+}
+
+#[test]
+fn local_array_dynamic_index_has_the_exact_closed_candidate_set() {
+    let before = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        struct S3;
+        impl Store for Postgres { fn save(&self) { postgres(); } }
+        impl Store for S3 { fn save(&self) { s3(); } }
+        fn postgres() {}
+        fn s3() {}
+        pub fn run(index: usize) {
+            let stores: [Box<dyn Store>; 2] = [Box::new(Postgres), Box::new(S3)];
+            stores[index].save();
+        }
+    "#;
+    let after = before.replace("fn s3() {}", "fn s3() { upload(); } fn upload() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("Postgres::save()"), "{rendered}");
+    assert!(rendered.contains("S3::save()"), "{rendered}");
+    assert!(rendered.contains("upload()"), "{rendered}");
+    assert!(!rendered.contains("[partial]"), "{rendered}");
+}
+
+#[test]
+fn enum_control_flow_has_the_exact_closed_candidate_set() {
+    let before = r#"
+        trait Store { fn save(&self); }
+        struct Postgres;
+        struct S3;
+        impl Store for Postgres { fn save(&self) { postgres(); } }
+        impl Store for S3 { fn save(&self) { s3(); } }
+        enum Choice { Postgres(Box<dyn Store>), S3(Box<dyn Store>) }
+        fn postgres() {}
+        fn s3() {}
+        pub fn run(use_s3: bool) {
+            let choice = if use_s3 {
+                Choice::S3(Box::new(S3))
+            } else {
+                Choice::Postgres(Box::new(Postgres))
+            };
+            let store = match choice {
+                Choice::Postgres(store) | Choice::S3(store) => store,
+            };
+            store.save();
+        }
+    "#;
+    let after = before.replace("fn s3() {}", "fn s3() { upload(); } fn upload() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("Postgres::save()"), "{rendered}");
+    assert!(rendered.contains("S3::save()"), "{rendered}");
+    assert!(rendered.contains("upload()"), "{rendered}");
+    assert!(!rendered.contains("[partial]"), "{rendered}");
+}
+
+#[test]
+fn enum_match_arms_keep_variant_specific_dynamic_provenance() {
+    let source = r#"
+        trait Work { fn work(&self); }
+        struct A;
+        struct B;
+        impl Work for A { fn work(&self) { a(); } }
+        impl Work for B { fn work(&self) { b(); } }
+        fn a() {}
+        fn b() {}
+        enum Choice { A(Box<dyn Work>), B(Box<dyn Work>) }
+        fn inspect_a(value: &dyn Work) { value.work(); }
+        fn inspect_b(value: &dyn Work) { value.work(); }
+        pub fn run(use_b: bool) {
+            let choice = if use_b {
+                Choice::B(Box::new(B))
+            } else {
+                Choice::A(Box::new(A))
+            };
+            match choice {
+                Choice::A(value) => inspect_a(&*value),
+                Choice::B(value) => inspect_b(&*value),
+            }
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+    let rendered = diffkit::render_call_tree_with_options(
+        &tree,
+        &RenderOptions {
+            show_types: false,
+            color: ColorMode::Plain,
+        },
+    );
+
+    let inspect_a = tree
+        .children
+        .iter()
+        .find(|child| child.label.default == "inspect_a(&*value)")
+        .unwrap();
+    let inspect_b = tree
+        .children
+        .iter()
+        .find(|child| child.label.default == "inspect_b(&*value)")
+        .unwrap();
+    assert_eq!(
+        inspect_a.children[0].children[0].label.default, "A::work()",
+        "{rendered}"
+    );
+    assert_eq!(inspect_a.children[0].children.len(), 1);
+    assert_eq!(
+        inspect_b.children[0].children[0].label.default, "B::work()",
+        "{rendered}"
+    );
+    assert_eq!(inspect_b.children[0].children.len(), 1);
+}
+
+#[test]
+fn writes_through_branch_merged_mutable_aliases_keep_each_paths_candidates() {
+    let source = r#"
+        trait Work { fn work(&self); }
+        struct A;
+        struct B;
+        struct C;
+        impl Work for A { fn work(&self) { a(); } }
+        impl Work for B { fn work(&self) { b(); } }
+        impl Work for C { fn work(&self) { c(); } }
+        fn a() {}
+        fn b() {}
+        fn c() {}
+        fn inspect_left(value: &dyn Work) { value.work(); }
+        fn inspect_right(value: &dyn Work) { value.work(); }
+        pub fn run(use_left: bool) {
+            let mut left: &dyn Work = &A;
+            let mut right: &dyn Work = &B;
+            let slot = if use_left { &mut left } else { &mut right };
+            *slot = &C;
+            inspect_left(left);
+            inspect_right(right);
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+    let rendered = diffkit::render_call_tree_with_options(
+        &tree,
+        &RenderOptions {
+            show_types: false,
+            color: ColorMode::Plain,
+        },
+    );
+
+    let left = &tree.children[0].children[0];
+    let right = &tree.children[1].children[0];
+    assert_eq!(
+        left.children
+            .iter()
+            .map(|candidate| candidate.label.default.as_str())
+            .collect::<Vec<_>>(),
+        ["A::work()", "C::work()"],
+        "{rendered}"
+    );
+    assert_eq!(
+        right
+            .children
+            .iter()
+            .map(|candidate| candidate.label.default.as_str())
+            .collect::<Vec<_>>(),
+        ["B::work()", "C::work()"],
+        "{rendered}"
+    );
+}
+
+#[test]
+fn writes_through_a_runtime_array_index_weakly_update_every_possible_element() {
+    let source = r#"
+        trait Work { fn work(&self); }
+        struct A;
+        struct B;
+        struct C;
+        impl Work for A { fn work(&self) { a(); } }
+        impl Work for B { fn work(&self) { b(); } }
+        impl Work for C { fn work(&self) { c(); } }
+        fn a() {}
+        fn b() {}
+        fn c() {}
+        fn inspect_first(value: &dyn Work) { value.work(); }
+        fn inspect_second(value: &dyn Work) { value.work(); }
+        pub fn run(index: usize) {
+            let mut values: [&dyn Work; 2] = [&A, &B];
+            values[index] = &C;
+            let [first, second] = values;
+            inspect_first(first);
+            inspect_second(second);
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+    let rendered = diffkit::render_call_tree_with_options(
+        &tree,
+        &RenderOptions {
+            show_types: false,
+            color: ColorMode::Plain,
+        },
+    );
+
+    assert_eq!(
+        tree.children[0].children[0]
+            .children
+            .iter()
+            .map(|candidate| candidate.label.default.as_str())
+            .collect::<Vec<_>>(),
+        ["A::work()", "C::work()"],
+        "{rendered}"
+    );
+    assert_eq!(
+        tree.children[1].children[0]
+            .children
+            .iter()
+            .map(|candidate| candidate.label.default.as_str())
+            .collect::<Vec<_>>(),
+        ["B::work()", "C::work()"],
+        "{rendered}"
+    );
+}
+
+#[test]
+fn compile_time_array_indices_do_not_merge_unrelated_elements() {
+    let source = r#"
+        trait Work { fn work(&self); }
+        struct A;
+        struct B;
+        impl Work for A { fn work(&self) { a(); } }
+        impl Work for B { fn work(&self) { b(); } }
+        fn a() {}
+        fn b() {}
+        fn inspect_first(value: &dyn Work) { value.work(); }
+        fn inspect_second(value: &dyn Work) { value.work(); }
+        pub fn run() {
+            let values: [&dyn Work; 2] = [&A, &B];
+            inspect_first(values[0]);
+            inspect_second(values[1]);
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+
+    assert_eq!(
+        tree.children[0].children[0].children[0].label.default,
+        "A::work()"
+    );
+    assert_eq!(tree.children[0].children[0].children.len(), 1);
+    assert_eq!(
+        tree.children[1].children[0].children[0].label.default,
+        "B::work()"
+    );
+    assert_eq!(tree.children[1].children[0].children.len(), 1);
+}
+
+#[test]
+fn async_closure_through_fn_mut_does_not_panic_or_leak_compiler_types() {
+    let source = r#"
+        fn needs_fn_mut<T>(mut callback: impl FnMut() -> T) { callback(); }
+        fn hello(value: &Worker) {
+            needs_fn_mut(async || { value.work(); });
+        }
+        struct Worker;
+        impl Worker { fn work(&self) {} }
+        pub fn run() { hello(&Worker); }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let call_labels = analysis
+        .functions
+        .iter()
+        .flat_map(|function| &function.calls)
+        .map(|call| call.label.default.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        call_labels
+            .iter()
+            .any(|label| label.contains("needs_fn_mut<λ#1>()")),
+        "{call_labels:#?}"
+    );
+    assert!(
+        call_labels
+            .iter()
+            .all(|label| !label.contains("async closure body@")),
+        "{call_labels:#?}"
+    );
+}
+
+#[test]
+fn method_called_inside_an_async_closure_keeps_its_impl_body_connected() {
+    let before = r#"
+        struct Ty;
+        impl Ty { fn hello(&self) { leaf(); } }
+        fn leaf() {}
+        fn needs_fn_mut<T>(mut callback: impl FnMut() -> T) { callback(); }
+        fn hello(value: &Ty) { needs_fn_mut(async || { value.hello(); }); }
+        pub fn run() { hello(&Ty); }
+    "#;
+    let after = before.replace("fn leaf() {}", "fn leaf() { changed(); } fn changed() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 12,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("Ty::hello()"), "{rendered}");
+    assert!(rendered.contains("leaf()"), "{rendered}");
+    assert!(rendered.contains("changed()"), "{rendered}");
+}
+
+#[test]
+fn async_closure_dyn_dispatch_keeps_the_captured_concrete_value() {
+    let before = r#"
+        trait Work { fn work(&self); }
+        struct Local;
+        struct Unrelated;
+        impl Work for Local { fn work(&self) { local(); } }
+        impl Work for Unrelated { fn work(&self) { unrelated(); } }
+        fn local() {}
+        fn unrelated() {}
+        pub async fn run() {
+            let worker: Box<dyn Work> = Box::new(Local);
+            let task = async move || { worker.work(); };
+            task().await;
+        }
+    "#;
+    let after = before.replace("fn local() {}", "fn local() { changed(); } fn changed() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 12,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("Local::work()"), "{rendered}");
+    assert!(rendered.contains("changed()"), "{rendered}");
+    assert!(!rendered.contains("Unrelated::work()"), "{rendered}");
+    assert!(!rendered.contains("[partial]"), "{rendered}");
+    assert!(!rendered.contains("[unresolved]"), "{rendered}");
+}
+
+#[test]
+fn macro_generated_closures_are_not_misattributed_as_duplicate_roots() {
+    let source = r#"
+        pub fn main() {
+            assert_eq!((|| || work())()(), ());
+        }
+        fn work() {}
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let main_count = analysis
+        .functions
+        .iter()
+        .filter(|function| function.label.default == "main()")
+        .count();
+
+    assert_eq!(main_count, 1, "{:#?}", analysis.functions);
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let main = graph.resolve_entry("main").unwrap().unwrap();
+    let tree = graph.build_call_tree(&main, 8).unwrap();
+    assert_eq!(tree.children[0].label.default, "λ#1()");
+    assert_eq!(tree.children[1].label.default, "λ#2()");
+    assert_eq!(tree.children[1].children[0].label.default, "work()");
+}
+
+#[test]
+fn calls_written_in_evaluated_macro_arguments_remain_in_the_tree() {
+    let source = r#"
+        trait Value { fn get(&self) -> i32; }
+        struct Concrete;
+        impl Value for Concrete { fn get(&self) -> i32 { leaf(); 1 } }
+        fn leaf() {}
+        pub fn run() {
+            let value: &dyn Value = &Concrete;
+            assert_eq!(value.get(), 1);
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+
+    assert_eq!(tree.children[0].label.default, "dyn Value::get()");
+    assert_eq!(
+        tree.children[0].children[0].label.default,
+        "Concrete::get()"
+    );
+    assert_eq!(
+        tree.children[0].children[0].children[0].label.default,
+        "leaf()"
+    );
+}
+
+#[test]
+fn recursively_expanding_generic_instantiations_return_an_error_instead_of_hanging() {
+    let source = r#"
+        fn recur<T>(value: T) {
+            recur(Some(value));
+        }
+        fn main() {
+            recur(());
+        }
+    "#;
+
+    let error = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("recursively expanding generic instantiation"),
+        "{error}"
+    );
+}
+
+#[test]
+fn trait_upcasting_uses_the_dispatch_traits_own_vtable_layout() {
+    let source = r#"
+        trait Base { fn base(&self) {} }
+        trait Left: Base { fn left(&self) {} }
+        trait Right: Base {
+            fn concrete(&self);
+            fn defaulted(&self) { default_work(); }
+        }
+        trait Diamond: Left + Right {}
+        impl Base for i32 {}
+        impl Left for i32 {}
+        impl Right for i32 { fn concrete(&self) { concrete_work(); } }
+        impl Diamond for i32 {}
+        fn concrete_work() {}
+        fn default_work() {}
+        pub fn run() {
+            let diamond: &dyn Diamond = &1;
+            let right: &dyn Right = diamond;
+            right.concrete();
+            right.defaulted();
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+    let rendered = diffkit::render_call_tree_with_options(
+        &tree,
+        &RenderOptions {
+            show_types: false,
+            color: ColorMode::Plain,
+        },
+    );
+
+    assert!(rendered.contains("i32::concrete()"), "{rendered}");
+    assert!(rendered.contains("concrete_work()"), "{rendered}");
+    assert!(rendered.contains("i32::defaulted()"), "{rendered}");
+    assert!(rendered.contains("default_work()"), "{rendered}");
+    assert!(!rendered.contains("[unresolved]"), "{rendered}");
+}
+
+#[test]
+fn unrelated_observed_vtables_do_not_trigger_supertrait_instance_queries() {
+    let source = r#"
+        trait Mirror { type Other; }
+        #[derive(Debug)]
+        struct Even(usize);
+        struct Odd;
+        impl Mirror for Even { type Other = Odd; }
+        impl Mirror for Odd { type Other = Even; }
+        trait Dyn<T: Mirror>: AsRef<<T as Mirror>::Other> {}
+        impl Dyn<Odd> for Even {}
+        impl AsRef<Even> for Even {
+            fn as_ref(&self) -> &Even { leaf(); self }
+        }
+        fn leaf() {}
+        fn code<T: Mirror>(value: &dyn Dyn<T>) -> &T::Other { value.as_ref() }
+        pub fn run() { let _ = format!("{:?}", code(&Even(22))); }
+    "#;
+    let after = source.replace("fn leaf() {}", "fn leaf() { changed(); } fn changed() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        source,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 12,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("Even::as_ref()"), "{rendered}");
+    assert!(rendered.contains("changed()"), "{rendered}");
+}
+
+#[test]
+fn generic_supertrait_default_method_calls_use_the_concrete_impl() {
+    let before = r#"
+        #[derive(Clone, Copy)] struct Value;
+        trait Parent { fn parent(self); }
+        trait Child: Parent + Sized { fn child(self) { invoke_parent(self); } }
+        fn invoke_parent<T: Parent>(value: T) { value.parent(); }
+        impl Parent for Value { fn parent(self) { leaf(); } }
+        impl Child for Value {}
+        fn leaf() {}
+        pub fn run() { Value.child(); }
+    "#;
+    let after = before.replace("fn leaf() {}", "fn leaf() { changed(); } fn changed() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 12,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("Value::parent()"), "{rendered}");
+    assert!(rendered.contains("changed()"), "{rendered}");
+    assert!(!rendered.contains("T::parent()"), "{rendered}");
+}
+
+#[test]
+fn primitive_generic_method_calls_render_the_concrete_receiver() {
+    let before = r#"
+        trait Parent { fn parent(self); }
+        fn invoke<T: Parent>(value: T) { value.parent(); }
+        impl Parent for isize { fn parent(self) { leaf(); } }
+        fn leaf() {}
+        pub fn run() { invoke(12isize); }
+    "#;
+    let after = before.replace("fn leaf() {}", "fn leaf() { changed(); } fn changed() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 12,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("isize::parent()"), "{rendered}");
+    assert!(rendered.contains("changed()"), "{rendered}");
+    assert!(!rendered.contains("T::parent()"), "{rendered}");
+}
+
+#[test]
+fn non_evaluating_macro_tokens_do_not_create_false_calls() {
+    let source = r#"
+        fn hidden() {}
+        pub fn run() { let _ = stringify!(hidden()); }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let run = analysis
+        .functions
+        .iter()
+        .find(|function| function.label.default == "run()")
+        .unwrap();
+
+    assert!(run.calls.is_empty(), "{:#?}", run.calls);
+}
+
+#[test]
+fn returned_closure_invocation_is_an_explicit_call_node() {
+    let before = r#"
+        fn make_callback() -> impl Fn() { || work() }
+        fn work() {}
+        pub fn run() { make_callback()(); }
+    "#;
+    let after = before.replace("fn work() {}", "fn work() { finish(); } fn finish() {}");
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("make_callback()"), "{rendered}");
+    assert!(rendered.contains("λ#1()"), "{rendered}");
+    assert!(rendered.contains("finish()"), "{rendered}");
+}
+
+#[test]
+fn closure_erased_behind_dyn_fn_keeps_its_lambda_body() {
+    let source = r#"
+        fn leaf() {}
+        pub fn run() {
+            let callback: Box<dyn Fn()> = Box::new(|| leaf());
+            callback();
+        }
+    "#;
+    let analysis = diffkit::language::rust::analyze_semantic_source(source, &[]).unwrap();
+    let graph = ProgramGraph::from_files([analysis]).unwrap();
+    let run = graph.resolve_entry("run").unwrap().unwrap();
+    let tree = graph.build_call_tree(&run, 8).unwrap();
+    let rendered = diffkit::render_call_tree_with_options(
+        &tree,
+        &RenderOptions {
+            show_types: false,
+            color: ColorMode::Plain,
+        },
+    );
+
+    assert!(rendered.contains("dyn Fn()::call"), "{rendered}");
+    assert!(rendered.contains("λ#1"), "{rendered}");
+    assert!(rendered.contains("leaf()"), "{rendered}");
+    assert!(!rendered.contains("[unresolved]"), "{rendered}");
+}
+
+#[test]
+fn nested_async_closures_keep_their_lexical_parent_and_body() {
+    let before = r#"
+        async fn work() {}
+        pub async fn run() {
+            let outer = async || {
+                let inner = async || work().await;
+                inner().await;
+            };
+            outer().await;
+        }
+    "#;
+    let after = before.replace(
+        "async fn work() {}",
+        "async fn work() { finish(); } fn finish() {}",
+    );
+    let report = rustdiff_sources(
+        "before.rs",
+        before,
+        "after.rs",
+        &after,
+        &DiffOptions {
+            entries: vec!["run".to_owned()],
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+    let rendered = render_plain(&report);
+
+    assert!(rendered.contains("λouter()"), "{rendered}");
+    assert!(rendered.contains("λinner()"), "{rendered}");
+    assert!(rendered.contains("finish()"), "{rendered}");
 }

@@ -127,7 +127,7 @@ fn diff_children(before: &[CallNode], after: &[CallNode]) -> Vec<DiffNode> {
 }
 
 fn nodes_equivalent(before: &CallNode, after: &CallNode) -> bool {
-    before.key == after.key
+    semantic_keys_equivalent(&before.key, &after.key)
         && labels_equivalent(&before.label.default, &after.label.default)
         && before.relation == after.relation
         && before.children.len() == after.children.len()
@@ -138,19 +138,17 @@ fn nodes_equivalent(before: &CallNode, after: &CallNode) -> bool {
             .all(|(before, after)| nodes_equivalent(before, after))
 }
 
-/// Prefer stable call-site identity and unchanged source labels while still
-/// allowing a modified call to align by semantic target. A plain key-only LCS
-/// pairs the wrong occurrences when the same callee is called repeatedly and
-/// one occurrence is inserted or removed.
+/// Prefer unchanged source labels and shallow call shape while still allowing
+/// a modified call to align by semantic target. `CallSiteId` currently embeds
+/// absolute source coordinates, so it must not influence cross-revision
+/// alignment: inserting a line can otherwise pair every repeated call with the
+/// following occurrence.
 fn alignment_weight(before: &CallNode, after: &CallNode) -> Option<usize> {
-    if before.key != after.key {
+    if !semantic_keys_equivalent(&before.key, &after.key) {
         return None;
     }
     let mut weight = 10usize;
-    if before.callsite.is_some() && before.callsite == after.callsite {
-        weight += 1_000;
-    }
-    if before.label.default == after.label.default {
+    if before.label.default == after.label.default && !before.label.default.contains("λ#") {
         weight += 100;
     } else if labels_equivalent(&before.label.default, &after.label.default) {
         weight += 80;
@@ -161,7 +159,30 @@ fn alignment_weight(before: &CallNode, after: &CallNode) -> Option<usize> {
     if same_shallow_children(before, after) {
         weight += 25;
     }
+    weight += matching_descendant_weight(before, after, 2).min(100);
     Some(weight)
+}
+
+fn semantic_keys_equivalent(before: &str, after: &str) -> bool {
+    before == after
+        || normalize_anonymous_lambda_keys(before) == normalize_anonymous_lambda_keys(after)
+}
+
+fn normalize_anonymous_lambda_keys(key: &str) -> String {
+    let mut normalized = String::with_capacity(key.len());
+    let mut remainder = key;
+    while let Some(start) = remainder.find("{lambda:") {
+        normalized.push_str(&remainder[..start]);
+        normalized.push_str("{lambda}");
+        let located = &remainder[start..];
+        let Some(end) = located.find('}') else {
+            normalized.push_str(located);
+            return normalized;
+        };
+        remainder = &located[end + 1..];
+    }
+    normalized.push_str(remainder);
+    normalized
 }
 
 fn labels_equivalent(before: &str, after: &str) -> bool {
@@ -188,8 +209,30 @@ fn same_shallow_children(before: &CallNode, after: &CallNode) -> bool {
             .iter()
             .zip(&after.children)
             .all(|(before, after)| {
-                before.key == after.key && before.label.default == after.label.default
+                semantic_keys_equivalent(&before.key, &after.key)
+                    && labels_equivalent(&before.label.default, &after.label.default)
             })
+}
+
+fn matching_descendant_weight(before: &CallNode, after: &CallNode, depth: usize) -> usize {
+    if depth == 0 || before.children.len() != after.children.len() {
+        return 0;
+    }
+    before
+        .children
+        .iter()
+        .zip(&after.children)
+        .map(|(before, after)| {
+            if !semantic_keys_equivalent(&before.key, &after.key) {
+                return 0;
+            }
+            10 + usize::from(labels_equivalent(
+                &before.label.default,
+                &after.label.default,
+            )) * 10
+                + matching_descendant_weight(before, after, depth - 1)
+        })
+        .sum()
 }
 
 /// Apply the presentation depth after the complete trees have been compared.
@@ -372,6 +415,39 @@ mod tests {
                 ("save(second)", DiffStatus::Same),
             ]
         );
+    }
+
+    #[test]
+    fn absolute_source_line_shifts_do_not_corrupt_repeated_call_alignment() {
+        let before = node(
+            "rust://root",
+            CallLabel::new("root()"),
+            vec![
+                call("rust://touch", "touch@4", "touch(item)"),
+                call("rust://touch", "touch@5", "touch(item)"),
+                call("rust://touch", "touch@6", "touch(item)"),
+            ],
+        );
+        let after = node(
+            "rust://root",
+            CallLabel::new("root()"),
+            vec![
+                call("rust://touch", "touch@5", "touch(item)"),
+                call("rust://touch", "touch@6", "touch(item)"),
+                call("rust://touch", "touch@7", "touch(item)"),
+                call("rust://finish", "finish@8", "finish()"),
+            ],
+        );
+
+        let diff = diff_optional(Some(&before), Some(&after)).unwrap();
+        assert_eq!(diff.children.len(), 4);
+        assert!(
+            diff.children[..3]
+                .iter()
+                .all(|node| node.status == DiffStatus::Same)
+        );
+        assert_eq!(diff.children[3].label.default, "finish()");
+        assert_eq!(diff.children[3].status, DiffStatus::Added);
     }
 
     #[test]

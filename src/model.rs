@@ -91,7 +91,19 @@ pub struct SourceSpan {
 pub enum CallSyntax {
     Path(Vec<String>),
     SelfMethod(String),
-    Method { receiver: String, method: String },
+    Method {
+        receiver: String,
+        method: String,
+    },
+    /// An explicit call whose callable is itself an expression (a returned
+    /// closure, function-valued field, index, conditional, and so on). The
+    /// language backend supplies its semantic target; common syntax fallback
+    /// deliberately does not guess one from this display fragment.
+    Expression(String),
+    /// Syntax written inside an expression-evaluating macro. It is retained
+    /// only when the semantic backend confirms a corresponding runtime call;
+    /// macro token trees are otherwise not assumed to execute as Rust code.
+    CompilerConfirmed(Box<CallSyntax>),
 }
 
 impl CallSyntax {
@@ -100,7 +112,22 @@ impl CallSyntax {
             Self::Path(parts) => parts.join("::"),
             Self::SelfMethod(method) => format!("self.{method}"),
             Self::Method { receiver, method } => format!("{receiver}.{method}"),
+            Self::Expression(expression) => expression.clone(),
+            Self::CompilerConfirmed(syntax) => {
+                format!("compiler-confirmed:{}", syntax.key_fragment())
+            }
         }
+    }
+
+    pub fn visible(&self) -> &Self {
+        match self {
+            Self::CompilerConfirmed(syntax) => syntax.visible(),
+            syntax => syntax,
+        }
+    }
+
+    pub fn requires_compiler_confirmation(&self) -> bool {
+        matches!(self, Self::CompilerConfirmed(_))
     }
 }
 
